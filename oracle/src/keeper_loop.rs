@@ -78,6 +78,11 @@ fn sign_keeper_tx(state: &AppState, tx: &stellar_xdr::Transaction) -> Result<Str
 }
 
 const PRICE_HEARTBEAT_INTERVAL_SECS: u64 = 30;
+/// When a cycle finds no pending work, the next cycle is delayed by this
+/// multiplier relative to `keeper_loop_interval` to avoid making 4 idle
+/// RPC/Horizon calls at the configured cadence (#1281). The extra sleep is
+/// added after the normal tick so the fast path (work present) is unaffected.
+const IDLE_BACKOFF_MULTIPLIER: u32 = 4;
 
 impl std::error::Error for SequenceFetchError {}
 
@@ -90,6 +95,7 @@ impl crate::retry::Retryable for SequenceFetchError {
 pub async fn run_keeper_loop(state: Arc<AppState>) {
     let mut ticker = interval(state.config.keeper_loop_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut was_idle = false;
 
     loop {
         tokio::select! {
@@ -97,6 +103,21 @@ pub async fn run_keeper_loop(state: Arc<AppState>) {
             _ = state.shutdown_token.cancelled() => {
                 tracing::info!("keeper_loop shutting down");
                 break;
+            }
+        }
+
+        // When the previous cycle found no pending work, sleep an extra
+        // IDLE_BACKOFF_MULTIPLIER * keeper_loop_interval before running again.
+        // This cuts the 4 idle RPC calls per tick down to 4 per (multiplier+1)
+        // ticks without changing the latency for cycles that have work to do.
+        if was_idle {
+            let backoff = state.config.keeper_loop_interval * IDLE_BACKOFF_MULTIPLIER;
+            tokio::select! {
+                _ = tokio::time::sleep(backoff) => {}
+                _ = state.shutdown_token.cancelled() => {
+                    tracing::info!("keeper_loop shutting down during idle backoff");
+                    break;
+                }
             }
         }
 
@@ -108,13 +129,20 @@ pub async fn run_keeper_loop(state: Arc<AppState>) {
         // any `in_flight_keys` entry it leaves behind is evicted by
         // `sweep_expired_in_flight_keys` or `IN_FLIGHT_EXPIRY` once the loop
         // restarts (#806).
+        let cycle_result;
         tokio::select! {
-            _ = run_keeper_cycle(Arc::clone(&state)) => {}
+            r = run_keeper_cycle(Arc::clone(&state)) => { cycle_result = Some(r); }
             _ = state.shutdown_token.cancelled() => {
                 tracing::info!("keeper_loop shutting down mid-cycle");
                 break;
             }
         }
+        was_idle = matches!(
+            cycle_result,
+            Some(Ok(ref s)) if s.orders_executed == 0
+                && s.deposits_executed == 0
+                && s.withdrawals_executed == 0
+        );
     }
 }
 
