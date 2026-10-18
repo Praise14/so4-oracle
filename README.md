@@ -87,8 +87,12 @@ ADMIN_API_TOKEN=<optional admin token>
 PRICE_LOOP_MS=1000
 KEEPER_LOOP_MS=1500
 
-# Price feed configuration (optional; falls back to embedded config/tokens.json)
-PRICE_FEED_CONFIG=/path/to/tokens.json
+# Price feed configuration (optional; falls back to embedded config/tokens.json).
+# Must be an inline JSON string — NOT a file path. Pass the JSON directly or
+# read a file at startup:
+#   PRICE_FEED_CONFIG="$(cat /path/to/tokens.json)"
+# Example with a single token entry:
+PRICE_FEED_CONFIG='[{"symbol":"TUSDC","display_symbol":"USDC","stellar_address":"CBAN5YU3KRDKPTQ2H76D6S7HQFPRBGUD524F65BUM2RQCITPTRLKWKES"}]'
 
 # Pyth authentication (optional now, mandatory once Pyth enforces auth)
 # PYTH_API_KEY=<your-pyth-api-key>
