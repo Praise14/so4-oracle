@@ -1195,6 +1195,8 @@ async fn get_pending_keys(
     count_method: &str,
     keys_method: &str,
 ) -> Result<Vec<String>, String> {
+    use std::sync::atomic::Ordering;
+
     let count_result = simulate_contract_call(
         state,
         &state.config.reader_contract_id,
@@ -1208,13 +1210,24 @@ async fn get_pending_keys(
         return Ok(Vec::new());
     }
 
+    // Rotate the start index so that keys near the end of the on-chain list
+    // are not permanently starved when there are more keys than the cycle can
+    // clear in one pass. The index wraps around at `count` so it is always a
+    // valid offset. (#1268)
+    let start = state
+        .pending_key_start_index
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
+            Some(if count <= 1 { 0 } else { (prev + 1) % count })
+        })
+        .unwrap_or(0);
+
     let keys_result = simulate_contract_call(
         state,
         &state.config.reader_contract_id,
         keys_method,
         &[
             &state.config.data_store_contract_id,
-            "0",
+            &start.to_string(),
             &count.to_string(),
         ],
     )
@@ -1234,6 +1247,15 @@ async fn get_pending_keys(
             "expected {count} keys from {keys_method}, got {}",
             keys.len()
         ));
+    }
+
+    // Re-order so we begin processing from `start`, then wrap around to the
+    // beginning of the list, giving every key equal cycle priority over time.
+    let start = start as usize;
+    if start > 0 && start < keys.len() {
+        let mut rotated = keys[start..].to_vec();
+        rotated.extend_from_slice(&keys[..start]);
+        return Ok(rotated);
     }
 
     Ok(keys)

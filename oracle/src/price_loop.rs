@@ -199,7 +199,7 @@ async fn execute_price_cycle(state: Arc<AppState>) -> (usize, usize, usize) {
         .collect();
 
     let binance_prices = if !binance_symbols.is_empty() {
-        match crate::binance::fetch_spot_prices(&binance_symbols).await {
+        match crate::binance::fetch_spot_prices_with_url(&state.config.binance_base_url, &binance_symbols).await {
             Ok(results) => {
                 let map: std::collections::HashMap<String, i128> = results.into_iter().collect();
                 Some(map)
@@ -391,6 +391,7 @@ async fn build_cached_price(
             pyth_prices,
             pyth_batch_failed,
             binance_prices,
+            &state.config.coinbase_base_url,
         )
         .await
         {
@@ -457,6 +458,7 @@ async fn fetch_source_with_retry(
     pyth_prices: &std::collections::HashMap<String, crate::pyth::PythPriceFeed>,
     pyth_batch_failed: bool,
     binance_prices: Option<&std::collections::HashMap<String, i128>>,
+    coinbase_base_url: &str,
 ) -> Result<i128, PriceSourceError> {
     crate::retry::retry_with_backoff(
         || async {
@@ -467,6 +469,7 @@ async fn fetch_source_with_retry(
                 pyth_prices,
                 pyth_batch_failed,
                 binance_prices,
+                coinbase_base_url,
             )
             .await
         },
@@ -484,6 +487,7 @@ async fn fetch_source_price(
     pyth_prices: &std::collections::HashMap<String, crate::pyth::PythPriceFeed>,
     pyth_batch_failed: bool,
     binance_prices: Option<&std::collections::HashMap<String, i128>>,
+    coinbase_base_url: &str,
 ) -> Result<i128, PriceSourceError> {
     match source {
         "binance" => {
@@ -517,7 +521,7 @@ async fn fetch_source_price(
                 .coinbase_symbol
                 .as_ref()
                 .ok_or_else(|| PriceSourceError::Config("missing coinbase_symbol".to_string()))?;
-            crate::coinbase::fetch_spot_price(symbol)
+            crate::coinbase::fetch_spot_price_with_url(coinbase_base_url, symbol)
                 .await
                 .map_err(PriceSourceError::Coinbase)
         }

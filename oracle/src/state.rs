@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -237,6 +237,10 @@ pub struct AppState {
     pub tx_signing_key: Option<Arc<ed25519_dalek::SigningKey>>,
     /// Throttles repeated failed admin-token attempts per client (#1214).
     pub admin_auth_limiter: Arc<AdminAuthLimiter>,
+    /// Round-robin start index for `get_pending_keys` fetches so keys near
+    /// the end of the on-chain list are not permanently starved when the list
+    /// is longer than the batch each cycle can process (#1268).
+    pub pending_key_start_index: Arc<AtomicU32>,
 }
 
 impl AppState {
@@ -268,6 +272,7 @@ impl AppState {
             price_signing_key,
             tx_signing_key,
             admin_auth_limiter: Arc::new(AdminAuthLimiter::default()),
+            pending_key_start_index: Arc::new(AtomicU32::new(0)),
         }
     }
 

@@ -118,6 +118,12 @@ pub struct Config {
     pub keeper_loop_interval: Duration,
     /// Token feed configuration (symbols, sources, addresses).
     pub price_feed: PriceFeedConfig,
+    /// Base URL for Coinbase exchange-rate requests. Defaults to the
+    /// production endpoint; override in tests to point at a mock server. (#1264)
+    pub coinbase_base_url: String,
+    /// Base URL for Binance spot-price requests. Defaults to the production
+    /// endpoint; override in tests to point at a mock server. (#1264)
+    pub binance_base_url: String,
 }
 
 /// Minimum length of `ADMIN_API_TOKEN`; shorter tokens are brute-forceable (#1214).
@@ -480,6 +486,8 @@ impl Config {
             price_loop_interval,
             keeper_loop_interval,
             price_feed,
+            coinbase_base_url: crate::coinbase::COINBASE_EXCHANGE_RATES_URL.to_string(),
+            binance_base_url: crate::binance::BINANCE_TICKER_PRICE_URL.to_string(),
         })
     }
 }
@@ -725,6 +733,8 @@ impl Config {
             price_loop_interval: std::time::Duration::from_secs(10),
             keeper_loop_interval: std::time::Duration::from_secs(10),
             price_feed: PriceFeedConfig { tokens: vec![] },
+            coinbase_base_url: crate::coinbase::COINBASE_EXCHANGE_RATES_URL.to_string(),
+            binance_base_url: crate::binance::BINANCE_TICKER_PRICE_URL.to_string(),
         }
     }
 }
