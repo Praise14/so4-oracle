@@ -6,17 +6,29 @@ FROM rust:1.95-slim@sha256:e14e87345b4d5964ddcc3491d27ee046a0f23820f340c3c1e24da
 
 WORKDIR /app
 
-# Install dependencies
+# ── Dependency caching layer (#1260) ─────────────────────────────────────────
+# Copy only the manifest files and a stub source tree first.  Docker caches
+# this layer and the `cargo build` below as long as Cargo.toml / Cargo.lock
+# don't change, so subsequent builds skip the full dependency compile even when
+# application source files are edited.
+COPY Cargo.toml Cargo.lock ./
+COPY shared/config/Cargo.toml ./shared/config/Cargo.toml
+COPY oracle/Cargo.toml ./oracle/Cargo.toml
+# config/tokens.json is embedded at compile time; provide a minimal stub so
+# include_str! resolves during the dependency-cache build.
+COPY config ./config
+RUN mkdir -p shared/config/src oracle/src \
+    && echo 'pub fn placeholder() {}' > shared/config/src/lib.rs \
+    && echo 'fn main() {}' > oracle/src/main.rs \
+    && cargo build --release --locked --bin oracle \
+    && rm -rf oracle/src shared/config/src
+# ─────────────────────────────────────────────────────────────────────────────
 
 # Copy workspace files
-COPY Cargo.toml Cargo.lock ./
 COPY shared/config ./shared/config
 COPY oracle ./oracle
-# config/tokens.json is embedded via include_str! at compile time and must
-# be present in the builder stage before cargo build runs (#502).
-COPY config ./config
 
-# Build the binary
+# Build the binary (deps already compiled above; only changed crates recompile)
 RUN cargo build --release --locked --bin oracle
 
 # Runtime stage
