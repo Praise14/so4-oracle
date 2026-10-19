@@ -31,6 +31,8 @@ const KEEPER_CYCLE_TIMEOUT_SECS: u64 = 50;
 const POST_SET_PRICES_SETTLE_MS: u64 = 5_000;
 /// Diagnostic-event substring Soroban embeds in budget-exceeded errors.
 const BUDGET_EXCEEDED_PATTERN: &str = "Budget, ExceededLimit";
+/// Contract error name emitted when a market's circuit breaker is tripped (#1256).
+const MARKET_PAUSED_PATTERN: &str = "MarketPaused";
 /// Maximum character length of raw RPC error JSON embedded in log fields (#1005).
 /// Matches the truncation discipline already applied to diagnostic events in
 /// `submit.rs::truncate_events_for_log` — raw error bodies from a misbehaving
@@ -490,6 +492,17 @@ async fn execute_keeper_cycle(state: Arc<AppState>) -> Result<CycleSummary, Stri
                 }
                 Err(error) => {
                     state.in_flight_keys.lock().await.remove(order_key);
+
+                    // Circuit-breaker pause: skip without counting toward
+                    // failure thresholds (#1256). The market pause is a
+                    // legitimate operational state; retrying is correct once
+                    // the admin lifts the pause, so these keys must not be
+                    // frozen or blacklisted.
+                    if is_market_paused_error(&error) {
+                        info!(key = %order_key, "order_skipped_market_paused");
+                        continue;
+                    }
+
                     summary.errors += 1;
                     warn!(key = %order_key, %error, "order_execution_failed");
 
@@ -748,6 +761,12 @@ async fn execute_keeper_cycle(state: Arc<AppState>) -> Result<CycleSummary, Stri
             }
             Err(error) => {
                 state.in_flight_keys.lock().await.remove(deposit_key);
+
+                if is_market_paused_error(&error) {
+                    info!(key = %deposit_key, "deposit_skipped_market_paused");
+                    continue;
+                }
+
                 summary.errors += 1;
                 warn!(key = %deposit_key, %error, "deposit_execution_failed");
 
@@ -925,6 +944,12 @@ async fn execute_keeper_cycle(state: Arc<AppState>) -> Result<CycleSummary, Stri
             }
             Err(error) => {
                 state.in_flight_keys.lock().await.remove(withdrawal_key);
+
+                if is_market_paused_error(&error) {
+                    info!(key = %withdrawal_key, "withdrawal_skipped_market_paused");
+                    continue;
+                }
+
                 summary.errors += 1;
                 warn!(key = %withdrawal_key, %error, "withdrawal_execution_failed");
 
@@ -1161,6 +1186,15 @@ fn is_budget_exceeded(error: &HandlerError) -> bool {
         }
     }
     false
+}
+
+/// Returns true when a handler error is a `MarketPaused` circuit-breaker
+/// revert (#1256). These should be skipped without incrementing the
+/// consecutive-failure counter or the freeze/blacklist thresholds, because the
+/// pause is a legitimate operational state that the admin will lift — it is not
+/// a sign that the order itself is broken.
+fn is_market_paused_error(error: &HandlerError) -> bool {
+    error.message.contains(MARKET_PAUSED_PATTERN)
 }
 
 /// Evict any `in_flight_keys` entry older than `IN_FLIGHT_EXPIRY`, regardless

@@ -179,7 +179,90 @@ pub async fn clear_blacklisted_key(
 }
 
 pub async fn metrics(_auth: AdminAuth, State(state): State<Arc<AppState>>) -> Response {
-    let prometheus = state.metrics.to_prometheus();
+    let mut prometheus = state.metrics.to_prometheus();
+
+    // ── Gauges from AppState not tracked by Metrics (#1267) ─────────────────
+
+    // keeper XLM balance (last known value; 0 until the first balance check).
+    let balance_stroops = state
+        .keeper_balance_below_min
+        .load(std::sync::atomic::Ordering::Relaxed);
+    // We expose the below-min flag as a gauge (0/1) since the raw balance is
+    // only known after a Horizon call. The balance_xlm gauge requires the live
+    // RPC call that /keeper/balance already serves; duplicating it here would
+    // block every scrape. Expose the boolean flag instead.
+    prometheus.push_str("# HELP oracle_keeper_balance_below_min 1 if keeper XLM balance is below minimum threshold\n");
+    prometheus.push_str("# TYPE oracle_keeper_balance_below_min gauge\n");
+    prometheus.push_str(&format!(
+        "oracle_keeper_balance_below_min {}\n",
+        if balance_stroops { 1 } else { 0 }
+    ));
+
+    // Per-token price age in seconds (#1267).
+    {
+        let cache = state.price_cache.read().await;
+        let now = std::time::SystemTime::now();
+        prometheus.push_str("# HELP oracle_price_age_seconds Seconds since each token's price was last cached\n");
+        prometheus.push_str("# TYPE oracle_price_age_seconds gauge\n");
+        for (symbol, price) in &cache.prices {
+            // CachedPrice.timestamp is a Unix timestamp in seconds set by the
+            // price loop when it stores a fetched price.
+            let age = now
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+                .saturating_sub(price.timestamp);
+            prometheus.push_str(&format!(
+                "oracle_price_age_seconds{{symbol=\"{}\"}} {}\n",
+                symbol, age
+            ));
+        }
+        // last_set_prices timestamp (#1267).
+        prometheus.push_str("# HELP oracle_last_set_prices_timestamp_seconds Unix timestamp of the last successful set_prices submission\n");
+        prometheus.push_str("# TYPE oracle_last_set_prices_timestamp_seconds gauge\n");
+        let last_ts = cache
+            .last_updated
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        prometheus.push_str(&format!(
+            "oracle_last_set_prices_timestamp_seconds {}\n",
+            last_ts
+        ));
+    }
+
+    // Pending work counts from KeeperStatus (#1267).
+    {
+        let ks = state.keeper_status.read().await;
+        prometheus.push_str("# HELP oracle_pending_keys Number of pending keys by kind\n");
+        prometheus.push_str("# TYPE oracle_pending_keys gauge\n");
+        prometheus.push_str(&format!(
+            "oracle_pending_keys{{kind=\"orders\"}} {}\n",
+            ks.pending_orders
+        ));
+        prometheus.push_str(&format!(
+            "oracle_pending_keys{{kind=\"deposits\"}} {}\n",
+            ks.pending_deposits
+        ));
+        prometheus.push_str(&format!(
+            "oracle_pending_keys{{kind=\"withdrawals\"}} {}\n",
+            ks.pending_withdrawals
+        ));
+    }
+
+    // In-flight and blacklisted key counts (#1267).
+    {
+        let in_flight = state.in_flight_keys.lock().await.len();
+        prometheus.push_str("# HELP oracle_in_flight_keys Keys currently being submitted on-chain\n");
+        prometheus.push_str("# TYPE oracle_in_flight_keys gauge\n");
+        prometheus.push_str(&format!("oracle_in_flight_keys {}\n", in_flight));
+
+        let blacklisted = state.frozen_order_blacklist.lock().await.len();
+        prometheus.push_str("# HELP oracle_blacklisted_keys Keys permanently abandoned after repeated failures\n");
+        prometheus.push_str("# TYPE oracle_blacklisted_keys gauge\n");
+        prometheus.push_str(&format!("oracle_blacklisted_keys {}\n", blacklisted));
+    }
+
     (
         StatusCode::OK,
         [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],

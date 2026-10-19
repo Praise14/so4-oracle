@@ -11,10 +11,12 @@ use axum::routing::{delete, get};
 use axum::{Json, Router};
 use serde::Serialize;
 use std::time::Duration;
+use tower::limit::ConcurrencyLimitLayer;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::set_header::SetResponseHeaderLayer;
+use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 use tracing::Span;
 
@@ -293,6 +295,15 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             HeaderValue::from_static("no-store"),
         ))
         .layer(axum::middleware::from_fn(map_method_not_allowed))
+        // Request timeout: return 408 if a handler takes longer than 30 s
+        // (#1259). Applied outside the trace layer so the span captures the
+        // timeout as a 408, not as an internal server error.
+        .layer(TimeoutLayer::new(Duration::from_secs(30)))
+        // Hard cap on concurrent requests (#1259). Excess requests receive
+        // 503 immediately rather than queuing, keeping /health and /ready
+        // reachable even under load. 512 is well above a single Fly machine's
+        // realistic per-instance concurrency while still bounding memory.
+        .layer(ConcurrencyLimitLayer::new(512))
 }
 
 #[cfg(test)]
