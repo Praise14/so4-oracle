@@ -112,11 +112,18 @@ pub async fn run_price_cycle(state: Arc<AppState>) {
             finish_cycle(&state, started, tokens_ok, tokens_failed, tokens_stale).await;
         }
         Err(_) => {
+            // On timeout the execute_price_cycle future is dropped and we lose its
+            // partial counters. Report every configured token as failed so the
+            // metrics reflect reality: hardcoding (0, 1, 0) only ever incremented
+            // the failure counter by 1 regardless of how many tokens were in-flight
+            // (issue #1278).
+            let total_tokens = state.config.price_feed.tokens.len();
             tracing::error!(
                 timeout_secs = PRICE_CYCLE_TIMEOUT_SECS,
+                tokens_failed = total_tokens,
                 "price cycle exceeded timeout budget"
             );
-            finish_cycle(&state, started, 0, 1, 0).await;
+            finish_cycle(&state, started, 0, total_tokens, 0).await;
         }
     }
 }
