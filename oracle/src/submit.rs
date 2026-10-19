@@ -3,11 +3,22 @@ use serde::Deserialize;
 
 use crate::stellar_rpc::{rpc_post, JsonRpcRequest, JsonRpcResponse, RpcError};
 
-const MAX_POLL_ATTEMPTS: u32 = 10;
+const MAX_POLL_ATTEMPTS: u32 = 6;
+const MAX_BACKOFF_MS: u64 = 16_000;
 #[cfg(not(test))]
 const INITIAL_BACKOFF_MS: u64 = 1_000;
 #[cfg(test)]
 const INITIAL_BACKOFF_MS: u64 = 1;
+
+// Matches the retry budget used at every other RPC call site
+// (get_account_sequence, simulate_contract_call, get_latest_ledger_sequence)
+// — a transient network blip reaching the RPC endpoint during submission
+// should be retried the same way, rather than aborting immediately (#1023).
+const SEND_TRANSACTION_RETRY_ATTEMPTS: u32 = 3;
+#[cfg(not(test))]
+const SEND_TRANSACTION_RETRY_BASE_DELAY_MS: u64 = 100;
+#[cfg(test)]
+const SEND_TRANSACTION_RETRY_BASE_DELAY_MS: u64 = 1;
 
 /// Maximum number of diagnostic-event XDR entries logged at warn/error level.
 /// Full payload capture is already available in the admin-gated failure ring
@@ -50,9 +61,17 @@ fn truncate_events_for_log(events: &[String]) -> Vec<String> {
 pub enum SubmitError {
     Rpc(RpcError),
     JsonError(String),
-    Rejected { status: String },
-    TransactionFailed { events: Vec<String> },
-    PollTimeout { hash: String },
+    Rejected {
+        status: String,
+        error_result_xdr: Option<String>,
+    },
+    Retryable(String),
+    TransactionFailed {
+        events: Vec<String>,
+    },
+    PollTimeout {
+        hash: String,
+    },
 }
 
 impl std::fmt::Display for SubmitError {
@@ -60,7 +79,14 @@ impl std::fmt::Display for SubmitError {
         match self {
             SubmitError::Rpc(e) => write!(f, "RPC error: {e}"),
             SubmitError::JsonError(msg) => write!(f, "JSON parse error: {msg}"),
-            SubmitError::Rejected { status } => write!(f, "transaction rejected: {status}"),
+            SubmitError::Rejected { status, error_result_xdr } => {
+                write!(f, "transaction rejected: {status}")?;
+                if let Some(xdr) = error_result_xdr {
+                    write!(f, " (errorResultXdr: {xdr})")?;
+                }
+                Ok(())
+            }
+            SubmitError::Retryable(msg) => write!(f, "retryable: {msg}"),
             SubmitError::TransactionFailed { events } => {
                 write!(
                     f,
@@ -76,6 +102,32 @@ impl std::fmt::Display for SubmitError {
 }
 
 impl std::error::Error for SubmitError {}
+
+impl SubmitError {
+    /// Whether the transaction may still confirm on-chain.
+    ///
+    /// Only [`SubmitError::PollTimeout`] qualifies: the node accepted the
+    /// transaction but it was not observed as confirmed within the poll
+    /// budget, so its outcome is genuinely undecided and the caller must not
+    /// re-submit. Every other variant is a definitive outcome — rejected
+    /// before inclusion, failed on-chain, or never sent — so a retry is safe.
+    ///
+    /// Callers use this to decide whether to keep a work key in
+    /// `in_flight_keys`; matching on the variant rather than on
+    /// `Display` text means rewording a message cannot silently flip that
+    /// decision (#719).
+    pub fn may_still_confirm(&self) -> bool {
+        matches!(self, SubmitError::PollTimeout { .. })
+    }
+
+    /// Diagnostic events attached to an on-chain failure, if any.
+    pub fn diagnostic_events(&self) -> &[String] {
+        match self {
+            SubmitError::TransactionFailed { events } => events,
+            _ => &[],
+        }
+    }
+}
 
 impl From<RpcError> for SubmitError {
     fn from(err: RpcError) -> Self {
@@ -148,17 +200,40 @@ async fn send_transaction_xdr(rpc_url: &str, signed_xdr: &str) -> Result<String,
     })
     .map_err(|e| SubmitError::JsonError(e.to_string()))?;
 
-    let body = rpc_post(rpc_url, payload).await.map_err(SubmitError::Rpc)?;
+    let body = crate::retry::retry_with_backoff(
+        || rpc_post(rpc_url, payload.clone()),
+        SEND_TRANSACTION_RETRY_ATTEMPTS,
+        SEND_TRANSACTION_RETRY_BASE_DELAY_MS,
+        crate::retry::MAX_BACKOFF_DELAY_MS,
+    )
+    .await
+    .map_err(SubmitError::Rpc)?;
 
     let result = parse_send_response(&body)?;
 
-    if result.status != "PENDING" {
-        return Err(SubmitError::Rejected {
+    match result.status.as_str() {
+        "PENDING" => Ok(result.hash),
+        // DUPLICATE: the transaction was already submitted and is being processed.
+        // Proceed to poll using the hash — the transaction is already pending.
+        "DUPLICATE" => {
+            tracing::debug!(
+                hash = result.hash,
+                "sendTransaction returned DUPLICATE; polling existing transaction"
+            );
+            Ok(result.hash)
+        }
+        // TRY_AGAIN_LATER: the node's submission queue is full — a genuinely
+        // transient condition that should be retried, not treated as a hard error.
+        "TRY_AGAIN_LATER" => Err(SubmitError::Retryable(format!(
+            "sendTransaction returned TRY_AGAIN_LATER for hash {}",
+            result.hash
+        ))),
+        // ERROR and any unrecognized status: hard rejection.
+        _ => Err(SubmitError::Rejected {
             status: result.status,
-        });
+            error_result_xdr: result.error_result_xdr,
+        }),
     }
-
-    Ok(result.hash)
 }
 
 /// Poll `getTransaction` until confirmed or until `MAX_POLL_ATTEMPTS` are exhausted.
@@ -190,8 +265,8 @@ async fn poll_until_confirmed(rpc_url: &str, hash: &str) -> Result<u32, SubmitEr
                         attempt,
                         "transient RPC/network error; will retry"
                     );
-                    sleep_ms(backoff_ms).await;
-                    backoff_ms = (backoff_ms * 2).min(30_000);
+                    sleep_ms(crate::retry::jitter(backoff_ms)).await;
+                    backoff_ms = (backoff_ms * 2).min(crate::retry::MAX_BACKOFF_DELAY_MS);
                     continue;
                 } else {
                     return Err(SubmitError::Rpc(rpc_err));
@@ -238,7 +313,7 @@ async fn poll_until_confirmed(rpc_url: &str, hash: &str) -> Result<u32, SubmitEr
                     "transaction still pending"
                 );
                 sleep_ms(backoff_ms).await;
-                backoff_ms = (backoff_ms * 2).min(30_000);
+                backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
             }
             _ => {
                 tracing::warn!(
@@ -248,7 +323,7 @@ async fn poll_until_confirmed(rpc_url: &str, hash: &str) -> Result<u32, SubmitEr
                     "unexpected transaction status; continuing poll"
                 );
                 sleep_ms(backoff_ms).await;
-                backoff_ms = (backoff_ms * 2).min(30_000);
+                backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
             }
         }
     }
@@ -410,6 +485,7 @@ mod tests {
     fn submit_error_display_rejected() {
         let err = SubmitError::Rejected {
             status: "ERROR".to_string(),
+            error_result_xdr: None,
         };
         assert_eq!(err.to_string(), "transaction rejected: ERROR");
     }
@@ -431,8 +507,13 @@ mod tests {
         let err = SubmitError::PollTimeout {
             hash: "abc123def456".to_string(),
         };
-        assert!(err.to_string().contains("not confirmed after 10 attempts"));
-        assert!(err.to_string().contains("abc123def456"));
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "transaction not confirmed after {MAX_POLL_ATTEMPTS} attempts \
+                 (hash: abc123def456); check status on next cycle"
+            )
+        );
     }
 
     #[test]
@@ -573,9 +654,13 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(err, SubmitError::PollTimeout { .. }));
         if let SubmitError::PollTimeout { hash } = err {
-            assert_eq!(hash, "abc123def456");
+            assert_eq!(
+                hash, "abc123def456",
+                "hash should be available for reconciliation"
+            );
+        } else {
+            panic!("expected PollTimeout error with hash");
         }
     }
 
@@ -599,32 +684,6 @@ mod tests {
 
         assert_eq!(ledger, 77);
         assert_eq!(mock.received_requests().await.unwrap().len(), 3);
-    }
-
-    #[tokio::test]
-    async fn poll_timeout_includes_hash_for_later_reconciliation() {
-        use wiremock::matchers::method;
-        use wiremock::{Mock, MockServer};
-
-        let mock = MockServer::start().await;
-        let pending = serde_json::json!({ "status": "PENDING" });
-        Mock::given(method("POST"))
-            .respond_with(rpc_responder(vec![pending; MAX_POLL_ATTEMPTS as usize]))
-            .mount(&mock)
-            .await;
-
-        let err = submit_and_poll(&mock.uri(), "signed_xdr_base64")
-            .await
-            .unwrap_err();
-
-        if let SubmitError::PollTimeout { hash } = err {
-            assert_eq!(
-                hash, "abc123def456",
-                "hash should be available for reconciliation"
-            );
-        } else {
-            panic!("expected PollTimeout error with hash");
-        }
     }
 
     #[tokio::test]
@@ -687,6 +746,7 @@ mod tests {
             match result {
                 Err(SubmitError::Rejected {
                     status: returned_status,
+                    ..
                 }) => {
                     assert_eq!(returned_status, status);
                 }
@@ -839,10 +899,12 @@ mod tests {
     async fn test_submit_and_poll_handles_http_error_on_send() {
         let mock_server = MockServer::start().await;
 
+        // A 500 is retryable (#1023), so send_transaction_xdr retries the
+        // full SEND_TRANSACTION_RETRY_ATTEMPTS budget before giving up.
         Mock::given(method("POST"))
             .and(path("/"))
             .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
-            .expect(1)
+            .expect(SEND_TRANSACTION_RETRY_ATTEMPTS as u64)
             .mount(&mock_server)
             .await;
 
@@ -852,6 +914,46 @@ mod tests {
         let result = submit_and_poll(&rpc_url, signed_xdr).await;
 
         assert!(matches!(result, Err(SubmitError::Rpc(_))));
+    }
+
+    // #1023 — a transient network/5xx blip during the initial sendTransaction
+    // call is retried rather than aborting the submission immediately.
+    #[tokio::test]
+    async fn test_send_transaction_retries_transient_failure_then_succeeds() {
+        let mock_server = MockServer::start().await;
+
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let request_count = AtomicUsize::new(0);
+
+        let send_response = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "status": "PENDING",
+                "hash": "abc123def456"
+            }
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(move |_: &wiremock::Request| {
+                let count = request_count.fetch_add(1, Ordering::SeqCst);
+                if count == 0 {
+                    ResponseTemplate::new(503).set_body_string("Service Unavailable")
+                } else {
+                    ResponseTemplate::new(200).set_body_json(send_response.clone())
+                }
+            })
+            .expect(2)
+            .mount(&mock_server)
+            .await;
+
+        let signed_xdr = "AAAAAA==";
+        let rpc_url = mock_server.uri();
+
+        let result = send_transaction_xdr(&rpc_url, signed_xdr).await;
+
+        assert_eq!(result.unwrap(), "abc123def456");
     }
 
     #[tokio::test]

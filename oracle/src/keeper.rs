@@ -6,6 +6,12 @@ use crate::stellar_rpc::{get_account_balance_stroops, RpcError};
 /// 1 XLM expressed in stroops.
 pub const XLM_IN_STROOPS: i64 = 10_000_000;
 
+/// Stellar's minimum base reserve: 0.5 XLM per entry × 2 (base + one
+/// subentry for the signer) = 1 XLM. This is locked and cannot be spent
+/// for transaction fees. The keeper needs this subtracted from its total
+/// balance to know what's actually available (#1215).
+pub const BASE_RESERVE_XLM: f64 = 1.0;
+
 /// Default minimum keeper balance: 10 XLM.
 pub const DEFAULT_MIN_KEEPER_BALANCE_XLM: f64 = 10.0;
 
@@ -31,39 +37,42 @@ pub async fn check_keeper_balance(
 ) -> Result<i64, RpcError> {
     let stroops = get_account_balance_stroops(&cfg.horizon_url, &cfg.account_id).await?;
 
-    let xlm = stroops as f64 / XLM_IN_STROOPS as f64;
-    if xlm < cfg.min_balance_xlm {
+    let total_xlm = stroops as f64 / XLM_IN_STROOPS as f64;
+    // Subtract the locked base reserve to get the spendable balance (#1215).
+    let spendable_xlm = total_xlm - BASE_RESERVE_XLM;
+    if spendable_xlm < cfg.min_balance_xlm {
         let was_below = below_min.swap(true, Ordering::Relaxed);
         if was_below {
             tracing::debug!(
-                balance_xlm = xlm,
+                balance_xlm = spendable_xlm,
                 min_balance_xlm = cfg.min_balance_xlm,
                 account_id = cfg.account_id,
                 "keeper balance still below minimum"
             );
         } else {
             tracing::error!(
-                balance_xlm = xlm,
+                balance_xlm = spendable_xlm,
                 min_balance_xlm = cfg.min_balance_xlm,
                 account_id = cfg.account_id,
                 "keeper balance below minimum"
             );
         }
         return Err(RpcError::BalanceBelowMinimum {
-            balance_xlm: xlm,
+            balance_stroops: stroops,
+            balance_xlm: spendable_xlm,
             min_xlm: cfg.min_balance_xlm,
         });
     }
 
     if below_min.swap(false, Ordering::Relaxed) {
         tracing::info!(
-            balance_xlm = xlm,
+            balance_xlm = spendable_xlm,
             min_balance_xlm = cfg.min_balance_xlm,
             "keeper balance recovered above minimum"
         );
     } else {
         tracing::debug!(
-            balance_xlm = xlm,
+            balance_xlm = spendable_xlm,
             min_balance_xlm = cfg.min_balance_xlm,
             "keeper balance ok"
         );
@@ -83,12 +92,14 @@ pub struct BalanceResponse {
 }
 
 pub fn build_balance_response(cfg: &KeeperBalanceConfig, stroops: i64) -> BalanceResponse {
-    let xlm = stroops as f64 / XLM_IN_STROOPS as f64;
+    let total_xlm = stroops as f64 / XLM_IN_STROOPS as f64;
+    // Subtract the locked base reserve to get the spendable balance (#1215).
+    let spendable_xlm = total_xlm - BASE_RESERVE_XLM;
     BalanceResponse {
         account_id: cfg.account_id.clone(),
         balance_stroops: stroops,
-        balance_xlm: xlm,
-        below_minimum: xlm < cfg.min_balance_xlm,
+        balance_xlm: spendable_xlm,
+        below_minimum: spendable_xlm < cfg.min_balance_xlm,
         min_balance_xlm: cfg.min_balance_xlm,
     }
 }
@@ -201,5 +212,4 @@ mod tests {
         let err = check_keeper_balance(&cfg, &below_min).await.unwrap_err();
         assert!(matches!(err, RpcError::NetworkError(_)));
     }
-
 }
