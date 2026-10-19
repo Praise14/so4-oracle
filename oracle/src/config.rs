@@ -637,13 +637,23 @@ pub fn parse_price_feed_config(raw: &str) -> Result<PriceFeedConfig, ConfigError
                         reason: "pyth_feed_id is required for pyth source".to_string(),
                     });
                 }
+                "fixed" => {
+                    // Validate and parse now so malformed values (e.g. "1e30",
+                    // "1.0", "-5") are caught at config load rather than
+                    // silently failing every price cycle (#1257).
+                    if let Err(e) = crate::fixed::fixed_price(token) {
+                        return Err(ConfigError::InvalidToken {
+                            symbol: token.symbol.clone(),
+                            reason: e.to_string(),
+                        });
+                    }
                 "fixed" if token.fixed_price.as_deref().unwrap_or("").is_empty() => {
                     return Err(ConfigError::InvalidToken {
                         symbol: token.symbol.clone(),
                         reason: "fixed_price is required for fixed source".to_string(),
                     });
                 }
-                "binance" | "coinbase" | "pyth" | "fixed" => {}
+                "binance" | "coinbase" | "pyth" => {}
                 other => {
                     return Err(ConfigError::InvalidToken {
                         symbol: token.symbol.clone(),
@@ -986,6 +996,34 @@ mod tests {
         let json = r#"[{"symbol":"TUSDC","stellar_address":"CBAN5YU3KRDKPTQ2H76D6S7HQFPRBGUD524F65BUM2RQCITPTRLKWKES","sources":["fixed"],"fixed_price":""}]"#;
         let err = parse_price_feed_config(json).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidToken { .. }));
+    }
+
+    #[test]
+    fn reject_fixed_price_float_string() {
+        // "1.0" passes is_some() but parse::<i128>() fails (#1257).
+        let json = r#"[{"symbol":"TUSDC","stellar_address":"CADDR","sources":["fixed"],"fixed_price":"1.0"}]"#;
+        let err = parse_price_feed_config(json).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidToken { ref symbol, .. } if symbol == "TUSDC"));
+    }
+
+    #[test]
+    fn reject_fixed_price_negative() {
+        let json = r#"[{"symbol":"TUSDC","stellar_address":"CADDR","sources":["fixed"],"fixed_price":"-1"}]"#;
+        let err = parse_price_feed_config(json).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidToken { ref symbol, .. } if symbol == "TUSDC"));
+    }
+
+    #[test]
+    fn reject_fixed_price_scientific_notation() {
+        let json = r#"[{"symbol":"TUSDC","stellar_address":"CADDR","sources":["fixed"],"fixed_price":"1e30"}]"#;
+        let err = parse_price_feed_config(json).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidToken { ref symbol, .. } if symbol == "TUSDC"));
+    }
+
+    #[test]
+    fn accept_valid_fixed_price() {
+        let json = r#"[{"symbol":"TUSDC","stellar_address":"CADDR","sources":["fixed"],"fixed_price":"10000000"}]"#;
+        assert!(parse_price_feed_config(json).is_ok());
     }
 
     #[test]
