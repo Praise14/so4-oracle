@@ -69,7 +69,15 @@ pub fn sign_transaction(
     secret_key: &str,
     network_passphrase: &str,
 ) -> Result<String, String> {
-    let key_bytes_raw = if secret_key.starts_with('S') {
+    let signing_key = signing_key_from_secret(secret_key)?;
+    sign_transaction_with_key(tx, &signing_key, network_passphrase)
+}
+
+/// Decode an S-strkey or 64-char hex secret into a `SigningKey` (#1226).
+/// Intermediate buffers are zeroised and `SigningKey` wipes itself on drop, so
+/// decode once at startup rather than per transaction.
+pub fn signing_key_from_secret(secret_key: &str) -> Result<ed25519_dalek::SigningKey, String> {
+    let key_bytes_raw = zeroize::Zeroizing::new(if secret_key.starts_with('S') {
         stellar_strkey::ed25519::PrivateKey::from_string(secret_key)
             .map_err(|e| format!("invalid secret strkey: {e}"))?
             .0
@@ -77,11 +85,14 @@ pub fn sign_transaction(
     } else if secret_key.len() == 64 && secret_key.chars().all(|c| c.is_ascii_hexdigit()) {
         hex::decode(secret_key).map_err(|e| format!("invalid secret key hex: {e}"))?
     } else {
+        // #735 — never echo any part of the secret key into an error message.
+        // Report only its length and format, which is enough to diagnose a
+        // misconfigured env var without leaking key material into logs.
         return Err(format!(
-            "secret key must be an S-prefixed strkey or 64-char hex, got: {}",
-            &secret_key[..secret_key.len().min(20)]
+            "secret key must be an S-prefixed strkey or 64-char hex (got {} chars, non-hex or wrong prefix)",
+            secret_key.len()
         ));
-    };
+    });
 
     if key_bytes_raw.len() != 32 {
         return Err(format!(
@@ -90,10 +101,17 @@ pub fn sign_transaction(
         ));
     }
 
-    let mut key_array = [0u8; 32];
+    let mut key_array = zeroize::Zeroizing::new([0u8; 32]);
     key_array.copy_from_slice(&key_bytes_raw);
-    let signing_key = ed25519_dalek::SigningKey::from_bytes(&key_array);
+    Ok(ed25519_dalek::SigningKey::from_bytes(&key_array))
+}
 
+/// Sign `tx` with an already-decoded key (no per-call key decoding, #1226).
+pub fn sign_transaction_with_key(
+    tx: &Transaction,
+    signing_key: &ed25519_dalek::SigningKey,
+    network_passphrase: &str,
+) -> Result<String, String> {
     let network_id_hash = compute_network_id(network_passphrase);
 
     let payload = TransactionSignaturePayload {
@@ -220,5 +238,29 @@ mod tests {
             None,
         );
         assert!(err.is_err());
+    }
+
+    /// Regression test for #1025: assert that `compute_network_id` produces the
+    /// well-known network ID hash for the real Stellar testnet passphrase. This
+    /// catches silent corruption of `TESTNET_PASSPHRASE` in `network_config.rs`.
+    #[test]
+    fn compute_network_id_matches_known_testnet_hash() {
+        let expected = sha256_hash(b"Test SDF Network ; September 2015");
+        let actual = compute_network_id(crate::network_config::TESTNET_PASSPHRASE);
+        assert_eq!(
+            actual, expected,
+            "TESTNET_PASSPHRASE in network_config.rs does not match the well-known testnet passphrase"
+        );
+    }
+
+    /// Regression test for #1025: same check for mainnet.
+    #[test]
+    fn compute_network_id_matches_known_mainnet_hash() {
+        let expected = sha256_hash(b"Public Global Stellar Network ; November 2015");
+        let actual = compute_network_id(crate::network_config::MAINNET_PASSPHRASE);
+        assert_eq!(
+            actual, expected,
+            "MAINNET_PASSPHRASE in network_config.rs does not match the well-known mainnet passphrase"
+        );
     }
 }

@@ -1,7 +1,10 @@
 use serde::Deserialize;
 
 pub const BINANCE_TICKER_PRICE_URL: &str = "https://data-api.binance.vision/api/v3/ticker/price";
-pub const FLOAT_PRECISION: i128 = 1_000_000_000_000_000_000_000_000_000_000;
+
+/// Re-exported from the crate root so existing `crate::binance::FLOAT_PRECISION`
+/// callers keep working; the value lives in one place now (#709).
+pub use crate::FLOAT_PRECISION;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BinancePriceError {
@@ -33,9 +36,15 @@ impl std::error::Error for BinancePriceError {}
 impl crate::retry::Retryable for BinancePriceError {
     fn is_retryable(&self) -> bool {
         match self {
-            // Network errors and 5xx HTTP errors are transient
+            // Network errors, 5xx HTTP errors, and 429 rate limits are
+            // transient. Binance answers an over-rate-limited client with
+            // 429, which is < 500 and would otherwise be treated as a
+            // permanent failure — abandoning the source for the rest of the
+            // cycle instead of backing off, the opposite of the right
+            // response (#708). Matches RpcError's classification in
+            // stellar_rpc.rs.
             Self::NetworkError(_) => true,
-            Self::HttpError { status, .. } => *status >= 500,
+            Self::HttpError { status, .. } => *status >= 500 || *status == 429,
             // Parse/JSON errors are permanent failures
             Self::JsonError(_) | Self::PriceParseError(_) => false,
         }
@@ -99,8 +108,8 @@ pub fn parse_ticker_http_result(
     parse_ticker_http_response(status_code, &body, symbols)
 }
 
-// Only exercised by the URL-shape tests below; the live fetch path builds its
-// query through reqwest instead.
+// Test-only convenience wrapper around the same URL builder used by the live
+// fetch path.
 #[cfg(test)]
 fn build_spot_price_url(symbols: &[String]) -> String {
     build_spot_price_url_for(BINANCE_TICKER_PRICE_URL, symbols)
@@ -177,11 +186,13 @@ pub fn parse_price_to_precision(raw: &str) -> Result<i128, BinancePriceError> {
         )));
     }
 
-    let whole_val = whole
-        .parse::<i128>()
-        .map_err(|_| BinancePriceError::PriceParseError(format!("invalid whole part: {text}")))?;
+    let whole_val = whole.parse::<i128>().map_err(|_| {
+        BinancePriceError::PriceParseError(format!(
+            "overflow for price (whole part too large): {text}"
+        ))
+    })?;
 
-    let scale_digits = 30usize;
+    let scale_digits = crate::SCALE_DIGITS as usize;
     // Use UTF-8-safe char iteration to take at most `scale_digits` digits.
     let normalized_frac = if frac.chars().count() >= scale_digits {
         frac.chars().take(scale_digits).collect::<String>()
@@ -230,6 +241,39 @@ mod tests {
         parse_ticker_http_result, parse_ticker_response_body, BinancePriceError,
         BINANCE_TICKER_PRICE_URL, FLOAT_PRECISION,
     };
+    use crate::retry::Retryable;
+
+    // #708 — a 429 from Binance means "slow down", not "give up". It must be
+    // retried with backoff instead of being classified as a permanent failure.
+    #[test]
+    fn http_error_429_is_retryable() {
+        let err = BinancePriceError::HttpError {
+            status: 429,
+            body: "too many requests".to_string(),
+        };
+        assert!(err.is_retryable());
+    }
+
+    #[test]
+    fn http_error_5xx_is_retryable_and_4xx_is_not() {
+        for status in [500, 502, 503] {
+            let err = BinancePriceError::HttpError {
+                status,
+                body: String::new(),
+            };
+            assert!(err.is_retryable(), "status {status} should be retryable");
+        }
+        for status in [400, 401, 404, 451] {
+            let err = BinancePriceError::HttpError {
+                status,
+                body: String::new(),
+            };
+            assert!(
+                !err.is_retryable(),
+                "status {status} should not be retryable"
+            );
+        }
+    }
 
     #[test]
     fn parse_price_integer() {
@@ -247,6 +291,18 @@ mod tests {
     #[test]
     fn parse_price_invalid() {
         assert!(parse_price_to_precision("abc").is_err());
+    }
+    #[test]
+    fn parse_price_reports_whole_part_overflow() {
+        let oversized_whole = "1".repeat(40);
+        let err = parse_price_to_precision(&oversized_whole).unwrap_err();
+
+        assert_eq!(
+            err,
+            BinancePriceError::PriceParseError(format!(
+                "overflow for price (whole part too large): {oversized_whole}"
+            )),
+        );
     }
 
     // #345 — rejects negatives and multiple dots

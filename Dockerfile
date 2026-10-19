@@ -1,15 +1,12 @@
 # Build stage
 # Must stay >= the highest MSRV in Cargo.lock — stellar-rpc-client 27 requires
 # Rust 1.93, jsonrpsee 0.26 requires 1.85, axum 0.8 requires 1.80.
-FROM rust:1.95-slim AS builder
+# Pinned to digest for reproducibility and supply-chain security (#1218).
+FROM rust:1.95-slim@sha256:e14e87345b4d5964ddcc3491d27ee046a0f23820f340c3c1e24da6880141f7c0 AS builder
 
 WORKDIR /app
 
 # Install dependencies
-RUN apt-get update && apt-get install -y \
-    pkg-config \
-    libssl-dev \
-    && rm -rf /var/lib/apt/lists/*
 
 # Copy workspace files
 COPY Cargo.toml Cargo.lock ./
@@ -23,7 +20,8 @@ COPY config ./config
 RUN cargo build --release --locked --bin oracle
 
 # Runtime stage
-FROM debian:bookworm-slim
+# Pinned to digest for reproducibility and supply-chain security (#1218).
+FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
 
 WORKDIR /app
 
@@ -36,8 +34,10 @@ RUN apt-get update && apt-get install -y \
 # Copy the binary from builder
 COPY --from=builder /app/target/release/oracle /app/oracle
 
-# Copy configuration files
-COPY config/tokens.json /app/config/tokens.json
+# No configuration files are copied into the runtime stage: the binary embeds
+# config/tokens.json at compile time via include_str! (see
+# oracle/src/config.rs) and PRICE_FEED_CONFIG, when set, is an inline JSON
+# value rather than a path. There is no file for the process to read (#769, #896).
 
 # Create non-root user
 RUN useradd -r -s /bin/false oracle
@@ -46,8 +46,10 @@ USER oracle
 # Expose port
 EXPOSE 8080
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+# Health check — timeout covers /ready's worst-case (RPC reachability +
+# keeper-balance retries), capped at 15s by READY_CHECK_TIMEOUT_SECS (#1042,
+# #1043). Use /health for pure liveness (always fast, in-memory only).
+HEALTHCHECK --interval=30s --timeout=20s --start-period=10s --retries=3 \
     CMD curl -f http://localhost:8080/health || exit 1
 
 # Run the binary

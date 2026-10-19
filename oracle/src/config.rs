@@ -17,6 +17,8 @@ pub const DEFAULT_KEEPER_LOOP_MS: u64 = 1_500;
 pub const DEFAULT_SET_PRICES_TX_FEE: u32 = 1_000_000;
 /// Default inclusion fee (stroops) for keeper handler transactions.
 pub const DEFAULT_KEEPER_TX_FEE: u32 = 2_000_000;
+/// Default timeout in seconds for graceful shutdown of background tasks.
+pub const DEFAULT_SHUTDOWN_TIMEOUT_SECS: u64 = 30;
 
 /// Oracle-specific view of a token feed config.
 /// Re-exports fields from `TokenConfig` for backward compatibility with
@@ -43,12 +45,13 @@ impl Network {
     }
 }
 
+/// A secret held in memory that is wiped (zeroised) when dropped (#1226).
 #[derive(Clone)]
-pub struct SecretString(String);
+pub struct SecretString(zeroize::Zeroizing<String>);
 
 impl SecretString {
     pub fn new(value: String) -> Self {
-        Self(value)
+        Self(zeroize::Zeroizing::new(value))
     }
 
     pub fn as_str(&self) -> &str {
@@ -64,33 +67,76 @@ impl fmt::Debug for SecretString {
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Address and port the HTTP server binds to. Env: `BIND_ADDR`, default `0.0.0.0:8080`.
     pub bind_addr: SocketAddr,
+    /// Stellar network to connect to. Env: `STELLAR_NETWORK`, default `testnet`.
     pub network: Network,
+    /// Stellar network passphrase for transaction signing.
     pub network_passphrase: String,
+    /// Stellar RPC node URL. Env: `STELLAR_RPC_URL` (defaults to public testnet RPC).
     pub stellar_rpc_url: String,
+    /// Horizon server URL for account queries. Env: `HORIZON_URL`.
     pub horizon_url: String,
+    /// On-chain oracle contract address. Env: `ORACLE_CONTRACT_ID`.
     pub oracle_contract_id: String,
+    /// On-chain role-store contract address. Env: `ROLE_STORE`.
     pub role_store_contract_id: String,
+    /// On-chain data-store contract address. Env: `DATA_STORE`.
     pub data_store_contract_id: String,
+    /// On-chain order-handler contract address. Env: `ORDER_HANDLER`.
     pub order_handler_contract_id: String,
+    /// On-chain deposit-handler contract address. Env: `DEPOSIT_HANDLER`.
     pub deposit_handler_contract_id: String,
+    /// On-chain withdrawal-handler contract address. Env: `WITHDRAWAL_HANDLER`.
     pub withdrawal_handler_contract_id: String,
+    /// On-chain reader contract address. Env: `READER`.
     pub reader_contract_id: String,
+    /// Keeper ed25519 private key (hex-encoded 32 bytes). Env: `KEEPER_PRIVATE_KEY`.
     pub keeper_private_key: SecretString,
+    /// Keeper Stellar strkey secret seed (S-prefixed). Env: `KEEPER_SECRET_KEY`.
     pub keeper_secret_key: SecretString,
+    /// Keeper Stellar account ID (G-prefixed strkey). Env: `KEEPER_ACCOUNT_ID`.
     pub keeper_account_id: String,
+    /// Index of this keeper instance, used only to label which keeper signed a
+    /// given price submission. Has no work-partitioning behavior — every
+    /// instance processes the full pending-work set regardless of index.
+    /// Env: `KEEPER_INDEX`, default `0`.
     pub keeper_index: u32,
+    /// Optional bearer token for admin API endpoints. Env: `ADMIN_API_TOKEN`.
     pub admin_api_token: Option<SecretString>,
     /// API key used to authenticate requests to the production Hermes endpoint.
     pub pyth_api_key: Option<SecretString>,
+    /// Minimum keeper XLM balance before halting (in XLM, not stroops). Env: `MIN_KEEPER_BALANCE_XLM`.
     pub min_keeper_balance_xlm: f64,
     /// Inclusion fee (stroops) for oracle `set_prices` transactions.
     pub set_prices_tx_fee: u32,
     /// Inclusion fee (stroops) for keeper handler execute/freeze transactions.
     pub keeper_tx_fee: u32,
+    /// Interval between price-feed refresh cycles. Env: `PRICE_LOOP_MS`, default 1000ms.
     pub price_loop_interval: Duration,
+    /// Interval between keeper execution cycles. Env: `KEEPER_LOOP_MS`, default 1500ms.
     pub keeper_loop_interval: Duration,
+    /// Token feed configuration (symbols, sources, addresses).
     pub price_feed: PriceFeedConfig,
+}
+
+/// Minimum length of `ADMIN_API_TOKEN`; shorter tokens are brute-forceable (#1214).
+pub const MIN_ADMIN_API_TOKEN_LEN: usize = 32;
+/// The sample value shipped in `.env.example`, rejected so it can't reach production.
+pub const ADMIN_API_TOKEN_PLACEHOLDER: &str = "your-admin-api-token-here";
+
+/// Reject admin tokens that are too short or still the documented placeholder (#1214).
+/// Never includes the token itself in the error.
+fn validate_admin_api_token(token: &str) -> Result<(), String> {
+    if token.trim() == ADMIN_API_TOKEN_PLACEHOLDER {
+        return Err("is still the .env.example placeholder; generate a random token".to_string());
+    }
+    if token.trim().chars().count() < MIN_ADMIN_API_TOKEN_LEN {
+        return Err(format!(
+            "must be at least {MIN_ADMIN_API_TOKEN_LEN} characters (e.g. `openssl rand -hex 32`)"
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,9 +166,9 @@ impl From<ConfigError> for EnvError {
 
 /// A collection of one or more environment-variable configuration errors.
 ///
-/// Returned by [`Config::from_lookup`] and [`Config::from_env`] when multiple
-/// fields are invalid or missing, allowing the caller to report every problem
-/// in a single pass rather than failing on the first one.
+/// Returned by [`Config::from_env`] when multiple fields are invalid or
+/// missing, allowing the caller to report every problem in a single pass
+/// rather than failing on the first one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnvErrors(pub Vec<EnvError>);
 
@@ -175,7 +221,7 @@ impl Config {
 
         let bind_addr = collect_or_default!(
             parse_or_default(&mut lookup, "BIND_ADDR", DEFAULT_BIND_ADDR),
-            "0.0.0.0:8080".parse().unwrap()
+            DEFAULT_BIND_ADDR.parse().unwrap()
         );
         let (network_passphrase, stellar_rpc_url, horizon_url) = match network {
             Network::Testnet => (
@@ -201,7 +247,7 @@ impl Config {
         };
 
         let price_feed = collect_or_default!(
-            load_price_feed_config(lookup("PRICE_FEED_CONFIG").as_deref()).map_err(EnvError::from),
+            load_price_feed_config(lookup(ENV_KEY).as_deref()).map_err(EnvError::from),
             PriceFeedConfig { tokens: vec![] }
         );
 
@@ -258,7 +304,16 @@ impl Config {
 
         let admin_api_token = lookup("ADMIN_API_TOKEN")
             .filter(|value| !value.trim().is_empty())
-            .map(SecretString::new);
+            .and_then(|value| match validate_admin_api_token(&value) {
+                Ok(()) => Some(SecretString::new(value)),
+                Err(reason) => {
+                    errors.push(EnvError::InvalidVar {
+                        var: "ADMIN_API_TOKEN",
+                        reason,
+                    });
+                    None
+                }
+            });
         let pyth_api_key = lookup("PYTH_API_KEY")
             .filter(|value| !value.trim().is_empty())
             .map(SecretString::new);
@@ -353,6 +408,49 @@ impl Config {
             Duration::from_millis(DEFAULT_KEEPER_LOOP_MS)
         );
 
+        // Every contract role must point at a different contract. `required`
+        // only proves each var is present and non-empty, so pasting one
+        // address into two slots (an easy copy/paste slip from a deployment
+        // manifest) used to boot cleanly and then fail much later, at RPC
+        // simulation time, with a generic contract-level error naming neither
+        // variable. Catch it here and name both sides.
+        //
+        // Values are compared trimmed, so a stray trailing space cannot hide a
+        // collision. They are not case-folded: Soroban strkeys are
+        // case-sensitive, and a mixed-case value is invalid input that
+        // simulation will reject anyway.
+        let contract_roles: [(&'static str, &str); 7] = [
+            ("ORACLE_CONTRACT_ID", &oracle_contract_id),
+            ("ROLE_STORE", &role_store_contract_id),
+            ("DATA_STORE", &data_store_contract_id),
+            ("ORDER_HANDLER", &order_handler_contract_id),
+            ("DEPOSIT_HANDLER", &deposit_handler_contract_id),
+            ("WITHDRAWAL_HANDLER", &withdrawal_handler_contract_id),
+            ("READER", &reader_contract_id),
+        ];
+        let mut seen: std::collections::HashMap<&str, &'static str> =
+            std::collections::HashMap::new();
+        for (var, value) in contract_roles {
+            let value = value.trim();
+            // A missing/empty value is already reported by `required`; don't
+            // pile a duplicate-value error on top of it.
+            if value.is_empty() {
+                continue;
+            }
+            match seen.get(value) {
+                Some(previous) => errors.push(EnvError::InvalidVar {
+                    var,
+                    reason: format!(
+                        "is set to the same contract ID as {previous} ({value}); each contract \
+                         role must point at a distinct contract"
+                    ),
+                }),
+                None => {
+                    seen.insert(value, var);
+                }
+            }
+        }
+
         if !errors.is_empty() {
             return Err(EnvErrors(errors));
         }
@@ -403,7 +501,9 @@ fn required_any(
     lookup(primary)
         .filter(|value| !value.trim().is_empty())
         .or_else(|| lookup(fallback).filter(|value| !value.trim().is_empty()))
-        .ok_or(EnvError::MissingVar(primary))
+        .ok_or(EnvError::MissingVar(
+            "ORACLE_CONTRACT_ID' (or fallback alias 'ORACLE')",
+        ))
 }
 
 fn parse_or_default<T>(
@@ -450,7 +550,7 @@ fn validate_hex_key(
 /// Validate a Stellar strkey (account `G…` / secret seed `S…`) for shape only:
 /// 56-char base32 with the expected version prefix. This catches typos and
 /// swapped vars at boot; it does not verify the CRC16 or that a secret derives
-/// the configured account (those are wired with the keeper in #3).
+/// the configured account (those are tracked in the keeper module).
 fn validate_strkey(var: &'static str, value: String, prefix: char) -> Result<String, EnvError> {
     let invalid = |reason: String| EnvError::InvalidVar { var, reason };
     if value.len() != 56 {
@@ -479,7 +579,7 @@ fn load_price_feed_config(raw: Option<&str>) -> Result<PriceFeedConfig, ConfigEr
 ///
 /// Expected format:
 /// ```json
-/// [{"symbol":"BTC","stellar_address":"C...","sources":["binance","coinbase"]}]
+/// [{"symbol":"BTC","stellar_address":"C...","sources":["binance","coinbase"],"binance_symbol":"BTCUSDT","coinbase_symbol":"BTC"}]
 /// ```
 pub fn parse_price_feed_config(raw: &str) -> Result<PriceFeedConfig, ConfigError> {
     let tokens = shared_config::parse_token_configs(raw)?;
@@ -490,6 +590,19 @@ pub fn parse_price_feed_config(raw: &str) -> Result<PriceFeedConfig, ConfigError
             return Err(ConfigError::InvalidToken {
                 symbol: token.symbol.clone(),
                 reason: "stellar_address must not be empty".to_string(),
+            });
+        }
+        // Token prices are written for Soroban token contracts, so the address
+        // must be a valid `C…` contract strkey. Rejecting it here (#1202, #970)
+        // keeps one bad entry from failing `encode_prices_vec` for the whole
+        // `set_prices` batch at runtime.
+        if stellar_strkey::Contract::from_string(&token.stellar_address).is_err() {
+            return Err(ConfigError::InvalidToken {
+                symbol: token.symbol.clone(),
+                reason: format!(
+                    "stellar_address '{}' is not a valid contract strkey (C…)",
+                    token.stellar_address
+                ),
             });
         }
         if token.sources.is_empty() {
@@ -518,13 +631,13 @@ pub fn parse_price_feed_config(raw: &str) -> Result<PriceFeedConfig, ConfigError
                         reason: "coinbase_symbol is required for coinbase source".to_string(),
                     });
                 }
-                "pyth" if token.pyth_feed_id.is_none() => {
+                "pyth" if token.pyth_feed_id.as_deref().unwrap_or("").is_empty() => {
                     return Err(ConfigError::InvalidToken {
                         symbol: token.symbol.clone(),
                         reason: "pyth_feed_id is required for pyth source".to_string(),
                     });
                 }
-                "fixed" if token.fixed_price.is_none() => {
+                "fixed" if token.fixed_price.as_deref().unwrap_or("").is_empty() => {
                     return Err(ConfigError::InvalidToken {
                         symbol: token.symbol.clone(),
                         reason: "fixed_price is required for fixed source".to_string(),
@@ -613,9 +726,15 @@ mod tests {
     use std::sync::{Mutex, OnceLock};
 
     const VALID_JSON: &str = r#"[
-        {"symbol":"BTC","stellar_address":"CBTCADDR","sources":["binance","coinbase"],"binance_symbol":"BTCUSDT","coinbase_symbol":"BTC"},
-        {"symbol":"ETH","stellar_address":"CETHADDR","sources":["binance"],"binance_symbol":"ETHUSDT","min_sources":1}
+        {"symbol":"BTC","stellar_address":"CCFTOPHUPSUDO2MB4X5D3XYJ2HRJ7NJPAW4UVPAVN7ZLE63EZLSMXDUO","sources":["binance","coinbase"],"binance_symbol":"BTCUSDT","coinbase_symbol":"BTC"},
+        {"symbol":"ETH","stellar_address":"CAJ6BZKGFT47ALGMVFZZGAOXBV2RWIVYVCU4WJCQIURKRNXU346RWVAU","sources":["binance"],"binance_symbol":"ETHUSDT","min_sources":1}
     ]"#;
+
+    #[test]
+    fn network_as_str_returns_expected_wire_values() {
+        assert_eq!(Network::Testnet.as_str(), "testnet");
+        assert_eq!(Network::Mainnet.as_str(), "mainnet");
+    }
 
     #[test]
     fn parse_or_default_uses_value_when_set() {
@@ -684,6 +803,19 @@ mod tests {
     }
 
     #[test]
+    fn config_from_lookup_uses_default_bind_addr_when_unset() {
+        let env = valid_env();
+        assert!(!env.contains_key("BIND_ADDR"));
+
+        let cfg = Config::from_lookup(|key| env.get(key).cloned()).unwrap();
+
+        assert_eq!(
+            cfg.bind_addr,
+            DEFAULT_BIND_ADDR.parse::<std::net::SocketAddr>().unwrap()
+        );
+    }
+
+    #[test]
     fn parse_valid_config() {
         let cfg = parse_price_feed_config(VALID_JSON).unwrap();
         assert_eq!(cfg.tokens.len(), 2);
@@ -707,7 +839,7 @@ mod tests {
 
     #[test]
     fn reject_token_with_empty_symbol() {
-        let json = r#"[{"symbol":"","stellar_address":"CADDR","sources":["binance"],"binance_symbol":"BTCUSDT"}]"#;
+        let json = r#"[{"symbol":"","stellar_address":"CBAN5YU3KRDKPTQ2H76D6S7HQFPRBGUD524F65BUM2RQCITPTRLKWKES","sources":["binance"],"binance_symbol":"BTCUSDT"}]"#;
         let err = parse_price_feed_config(json).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidToken { .. }));
     }
@@ -722,9 +854,55 @@ mod tests {
         ));
     }
 
+    /// #1202 — a valid `G…` account strkey is not a token contract address.
+    #[test]
+    fn reject_token_with_account_stellar_address() {
+        let account = "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN7";
+        assert!(stellar_strkey::ed25519::PublicKey::from_string(account).is_ok());
+        let json = format!(
+            r#"[{{"symbol":"BTC","stellar_address":"{account}","sources":["binance"],"binance_symbol":"BTCUSDT"}}]"#
+        );
+        let err = parse_price_feed_config(&json).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::InvalidToken { ref symbol, ref reason }
+                if symbol == "BTC" && reason.contains("contract strkey")
+        ));
+    }
+
+    /// #1202 — placeholder / malformed addresses are rejected at load time.
+    #[test]
+    fn reject_token_with_malformed_stellar_address() {
+        for bad in [
+            "CBTCADDR",
+            "not-a-strkey",
+            "CBAN5YU3KRDKPTQ2H76D6S7HQFPRBGUD524F65BUM2RQCITPTRLKWKEA",
+        ] {
+            let json = format!(
+                r#"[{{"symbol":"BTC","stellar_address":"{bad}","sources":["binance"],"binance_symbol":"BTCUSDT"}}]"#
+            );
+            let err = parse_price_feed_config(&json).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::InvalidToken { ref symbol, ref reason }
+                        if symbol == "BTC" && reason.contains("contract strkey")
+                ),
+                "expected rejection for {bad}"
+            );
+        }
+    }
+
+    /// #1202 — the embedded default tokens.json must still load.
+    #[test]
+    fn embedded_tokens_json_has_valid_contract_addresses() {
+        parse_price_feed_config(include_str!("../../config/tokens.json"))
+            .expect("config/tokens.json must parse with valid contract strkeys");
+    }
+
     #[test]
     fn reject_token_with_empty_sources() {
-        let json = r#"[{"symbol":"BTC","stellar_address":"CADDR","sources":[]}]"#;
+        let json = r#"[{"symbol":"BTC","stellar_address":"CBAN5YU3KRDKPTQ2H76D6S7HQFPRBGUD524F65BUM2RQCITPTRLKWKES","sources":[]}]"#;
         let err = parse_price_feed_config(json).unwrap_err();
         assert!(matches!(
             err,
@@ -735,8 +913,8 @@ mod tests {
     #[test]
     fn per_token_source_list_preserved() {
         let json = r#"[
-            {"symbol":"BTC","stellar_address":"CBADDR","sources":["binance"],"binance_symbol":"BTCUSDT","min_sources":1},
-            {"symbol":"ETH","stellar_address":"CEADDR","sources":["coinbase"],"coinbase_symbol":"ETH","min_sources":1}
+            {"symbol":"BTC","stellar_address":"CCFTOPHUPSUDO2MB4X5D3XYJ2HRJ7NJPAW4UVPAVN7ZLE63EZLSMXDUO","sources":["binance"],"binance_symbol":"BTCUSDT","min_sources":1},
+            {"symbol":"ETH","stellar_address":"CAJ6BZKGFT47ALGMVFZZGAOXBV2RWIVYVCU4WJCQIURKRNXU346RWVAU","sources":["coinbase"],"coinbase_symbol":"ETH","min_sources":1}
         ]"#;
         let cfg = parse_price_feed_config(json).unwrap();
         assert_eq!(cfg.tokens[0].sources, vec!["binance"]);
@@ -755,14 +933,14 @@ mod tests {
     /// #324 — entry with empty symbol → InvalidToken.
     #[test]
     fn parse_token_configs_empty_symbol_returns_invalid_token() {
-        let json = r#"[{"symbol":"","stellar_address":"CADDR","sources":["binance"]}]"#;
+        let json = r#"[{"symbol":"","stellar_address":"CBAN5YU3KRDKPTQ2H76D6S7HQFPRBGUD524F65BUM2RQCITPTRLKWKES","sources":["binance"]}]"#;
         let err = parse_price_feed_config(json).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidToken { .. }));
     }
 
     #[test]
     fn reject_missing_coinbase_symbol() {
-        let json = r#"[{"symbol":"TWBTC","stellar_address":"CADDR","sources":["coinbase"]}]"#;
+        let json = r#"[{"symbol":"TWBTC","stellar_address":"CBAN5YU3KRDKPTQ2H76D6S7HQFPRBGUD524F65BUM2RQCITPTRLKWKES","sources":["coinbase"]}]"#;
         let err = parse_price_feed_config(json).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidToken { .. }));
     }
@@ -777,35 +955,49 @@ mod tests {
 
     #[test]
     fn reject_missing_binance_symbol() {
-        let json = r#"[{"symbol":"TWBTC","stellar_address":"CADDR","sources":["binance"]}]"#;
+        let json = r#"[{"symbol":"TWBTC","stellar_address":"CBAN5YU3KRDKPTQ2H76D6S7HQFPRBGUD524F65BUM2RQCITPTRLKWKES","sources":["binance"]}]"#;
         let err = parse_price_feed_config(json).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidToken { .. }));
     }
 
     #[test]
     fn reject_missing_pyth_feed_id() {
-        let json = r#"[{"symbol":"TWBTC","stellar_address":"CADDR","sources":["pyth"]}]"#;
+        let json = r#"[{"symbol":"TWBTC","stellar_address":"CBAN5YU3KRDKPTQ2H76D6S7HQFPRBGUD524F65BUM2RQCITPTRLKWKES","sources":["pyth"]}]"#;
+        let err = parse_price_feed_config(json).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidToken { .. }));
+    }
+
+    #[test]
+    fn reject_empty_pyth_feed_id() {
+        let json = r#"[{"symbol":"TWBTC","stellar_address":"CBAN5YU3KRDKPTQ2H76D6S7HQFPRBGUD524F65BUM2RQCITPTRLKWKES","sources":["pyth"],"pyth_feed_id":""}]"#;
         let err = parse_price_feed_config(json).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidToken { .. }));
     }
 
     #[test]
     fn reject_missing_fixed_price() {
-        let json = r#"[{"symbol":"TUSDC","stellar_address":"CADDR","sources":["fixed"]}]"#;
+        let json = r#"[{"symbol":"TUSDC","stellar_address":"CBAN5YU3KRDKPTQ2H76D6S7HQFPRBGUD524F65BUM2RQCITPTRLKWKES","sources":["fixed"]}]"#;
+        let err = parse_price_feed_config(json).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidToken { .. }));
+    }
+
+    #[test]
+    fn reject_empty_fixed_price() {
+        let json = r#"[{"symbol":"TUSDC","stellar_address":"CBAN5YU3KRDKPTQ2H76D6S7HQFPRBGUD524F65BUM2RQCITPTRLKWKES","sources":["fixed"],"fixed_price":""}]"#;
         let err = parse_price_feed_config(json).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidToken { .. }));
     }
 
     #[test]
     fn per_source_rejects_unsupported_source() {
-        let json = r#"[{"symbol":"BTC","stellar_address":"CADDR","sources":["kraken"]}]"#;
+        let json = r#"[{"symbol":"BTC","stellar_address":"CBAN5YU3KRDKPTQ2H76D6S7HQFPRBGUD524F65BUM2RQCITPTRLKWKES","sources":["kraken"]}]"#;
         let err = parse_price_feed_config(json).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidToken { ref symbol, .. } if symbol == "BTC"));
     }
 
     #[test]
     fn per_source_rejects_empty_source_name() {
-        let json = r#"[{"symbol":"BTC","stellar_address":"CADDR","sources":[""]}]"#;
+        let json = r#"[{"symbol":"BTC","stellar_address":"CBAN5YU3KRDKPTQ2H76D6S7HQFPRBGUD524F65BUM2RQCITPTRLKWKES","sources":[""]}]"#;
         let err = parse_price_feed_config(json).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidToken { ref symbol, .. } if symbol == "BTC"));
     }
@@ -813,7 +1005,7 @@ mod tests {
     #[test]
     fn reject_min_sources_exceeds_sources_length() {
         let json = r#"[
-            {"symbol":"BTC","stellar_address":"CBTCADDR","sources":["binance"],"binance_symbol":"BTCUSDT","min_sources":2}
+            {"symbol":"BTC","stellar_address":"CCFTOPHUPSUDO2MB4X5D3XYJ2HRJ7NJPAW4UVPAVN7ZLE63EZLSMXDUO","sources":["binance"],"binance_symbol":"BTCUSDT","min_sources":2}
         ]"#;
         let err = parse_price_feed_config(json).unwrap_err();
         assert!(matches!(
@@ -826,7 +1018,7 @@ mod tests {
     #[test]
     fn accept_min_sources_equal_to_sources_length() {
         let json = r#"[
-            {"symbol":"BTC","stellar_address":"CBTCADDR","sources":["binance"],"binance_symbol":"BTCUSDT","min_sources":1}
+            {"symbol":"BTC","stellar_address":"CCFTOPHUPSUDO2MB4X5D3XYJ2HRJ7NJPAW4UVPAVN7ZLE63EZLSMXDUO","sources":["binance"],"binance_symbol":"BTCUSDT","min_sources":1}
         ]"#;
         let cfg = parse_price_feed_config(json).unwrap();
         assert_eq!(cfg.tokens.len(), 1);
@@ -836,7 +1028,7 @@ mod tests {
     #[test]
     fn accept_min_sources_less_than_sources_length() {
         let json = r#"[
-            {"symbol":"BTC","stellar_address":"CBTCADDR","sources":["binance","coinbase"],"binance_symbol":"BTCUSDT","coinbase_symbol":"BTC","min_sources":1}
+            {"symbol":"BTC","stellar_address":"CCFTOPHUPSUDO2MB4X5D3XYJ2HRJ7NJPAW4UVPAVN7ZLE63EZLSMXDUO","sources":["binance","coinbase"],"binance_symbol":"BTCUSDT","coinbase_symbol":"BTC","min_sources":1}
         ]"#;
         let cfg = parse_price_feed_config(json).unwrap();
         assert_eq!(cfg.tokens.len(), 1);
@@ -856,7 +1048,7 @@ mod tests {
 
     #[test]
     fn load_price_feed_config_uses_env_when_set() {
-        let json = r#"[{"symbol":"BTC","stellar_address":"CADDR","sources":["binance"],"binance_symbol":"BTCUSDT","min_sources":1}]"#;
+        let json = r#"[{"symbol":"BTC","stellar_address":"CBAN5YU3KRDKPTQ2H76D6S7HQFPRBGUD524F65BUM2RQCITPTRLKWKES","sources":["binance"],"binance_symbol":"BTCUSDT","min_sources":1}]"#;
         let cfg = load_price_feed_config(Some(json)).unwrap();
         assert_eq!(cfg.tokens.len(), 1);
         assert_eq!(cfg.tokens[0].symbol, "BTC");
@@ -911,8 +1103,127 @@ mod tests {
                 "KEEPER_ACCOUNT_ID",
                 "GAUHMCMUP5FZO5675W3ISZ6E6CNYJGXBUW5WANE2JR4TGAARYCTSCBKI".to_string(),
             ),
-            ("ADMIN_API_TOKEN", "test-admin-token".to_string()),
+            (
+                "ADMIN_API_TOKEN",
+                "test-admin-token-0123456789abcdef".to_string(),
+            ),
         ])
+    }
+
+    // ── distinct contract roles ───────────────────────────────────────────────
+
+    /// Flattens `EnvErrors` into one string per entry so a test can assert on
+    /// which variables were reported.
+    fn error_messages(err: &EnvErrors) -> Vec<String> {
+        match err {
+            EnvErrors(list) => list.iter().map(|e| e.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn distinct_contract_ids_boot_cleanly() {
+        let env = valid_env();
+        assert!(
+            Config::from_lookup(|key| env.get(key).cloned()).is_ok(),
+            "seven distinct contract IDs must not trip the duplicate check"
+        );
+    }
+
+    #[test]
+    fn duplicate_contract_ids_are_rejected_at_boot_naming_both_vars() {
+        let mut env = valid_env();
+        // The realistic operator slip: ORDER_HANDLER copy-pasted over
+        // DEPOSIT_HANDLER.
+        let shared = env.get("ORDER_HANDLER").unwrap().clone();
+        env.insert("DEPOSIT_HANDLER", shared.clone());
+
+        let err = Config::from_lookup(|key| env.get(key).cloned())
+            .expect_err("duplicate contract IDs must fail at boot");
+
+        let messages = error_messages(&err);
+        assert_eq!(messages.len(), 1, "expected one error, got {messages:?}");
+        let message = &messages[0];
+        assert!(
+            message.contains("DEPOSIT_HANDLER"),
+            "error must name the offending var: {message}"
+        );
+        assert!(
+            message.contains("ORDER_HANDLER"),
+            "error must name the var it collides with: {message}"
+        );
+        assert!(
+            message.contains(&shared),
+            "error must quote the duplicated ID: {message}"
+        );
+    }
+
+    #[test]
+    fn every_contract_role_pair_is_checked() {
+        // Whichever var is overwritten with another var's value, the boot must
+        // fail — the check is not limited to one hand-picked pair.
+        let vars = [
+            "ORACLE_CONTRACT_ID",
+            "ROLE_STORE",
+            "DATA_STORE",
+            "ORDER_HANDLER",
+            "DEPOSIT_HANDLER",
+            "WITHDRAWAL_HANDLER",
+            "READER",
+        ];
+        for (i, target) in vars.iter().enumerate() {
+            let source = vars[(i + 1) % vars.len()];
+            let mut env = valid_env();
+            let value = env.get(source).unwrap().clone();
+            env.insert(*target, value);
+
+            let err = Config::from_lookup(|key| env.get(key).cloned())
+                .expect_err(&format!("{target} == {source} must fail at boot"));
+            let messages = error_messages(&err);
+            assert_eq!(
+                messages.len(),
+                1,
+                "{target} == {source}: expected one error, got {messages:?}"
+            );
+            assert!(
+                messages[0].contains(target) && messages[0].contains(source),
+                "{target} == {source}: error must name both vars, got {}",
+                messages[0]
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_detection_ignores_surrounding_whitespace() {
+        let mut env = valid_env();
+        let order_handler = env.get("ORDER_HANDLER").unwrap().clone();
+        env.insert("READER", format!("  {order_handler}  "));
+
+        let err = Config::from_lookup(|key| env.get(key).cloned())
+            .expect_err("trailing whitespace must not hide a collision");
+        let messages = error_messages(&err);
+        assert!(
+            messages[0].contains("READER"),
+            "error must name the offending var: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn missing_contract_id_is_reported_once_not_as_a_duplicate() {
+        let mut env = valid_env();
+        env.remove("READER");
+
+        let err = Config::from_lookup(|key| env.get(key).cloned())
+            .expect_err("a missing var must still fail");
+        let messages = error_messages(&err);
+        assert_eq!(
+            messages.len(),
+            1,
+            "an absent var should not also be reported as a duplicate: {messages:?}"
+        );
+        assert!(
+            messages[0].contains("READER"),
+            "error must name the missing var: {messages:?}"
+        );
     }
 
     #[test]
@@ -922,6 +1233,8 @@ mod tests {
 
         assert_eq!(cfg.network, Network::Testnet);
         assert_eq!(cfg.stellar_rpc_url, TESTNET_RPC_URL);
+        // #1169 — pin the literal so the default can't regress to a non-RPC host.
+        assert_eq!(cfg.stellar_rpc_url, "https://soroban-testnet.stellar.org");
         assert_eq!(cfg.network_passphrase, TESTNET_PASSPHRASE);
         assert_eq!(
             cfg.price_loop_interval,
@@ -1059,6 +1372,36 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn config_from_lookup_rejects_short_or_placeholder_admin_token() {
+        for bad in ["short-token", ADMIN_API_TOKEN_PLACEHOLDER] {
+            let mut env = valid_env();
+            env.insert("ADMIN_API_TOKEN", bad.to_string());
+            let err = Config::from_lookup(|key| env.get(key).cloned()).unwrap_err();
+            assert!(
+                err.0.iter().any(|e| matches!(
+                    e,
+                    EnvError::InvalidVar {
+                        var: "ADMIN_API_TOKEN",
+                        ..
+                    }
+                )),
+                "{bad:?} must be rejected: {:?}",
+                err.0
+            );
+            // The token value itself must never appear in the error.
+            assert!(!format!("{:?}", err.0).contains("short-token"));
+        }
+    }
+
+    #[test]
+    fn config_from_lookup_accepts_long_admin_token() {
+        let mut env = valid_env();
+        env.insert("ADMIN_API_TOKEN", "a".repeat(MIN_ADMIN_API_TOKEN_LEN));
+        let cfg = Config::from_lookup(|key| env.get(key).cloned()).unwrap();
+        assert!(cfg.admin_api_token.is_some());
     }
 
     #[test]
@@ -1203,5 +1546,37 @@ mod tests {
             "expected at least 2 errors, got {}",
             err.0.len()
         );
+    }
+
+    #[test]
+    fn config_from_lookup_rejects_zero_set_prices_tx_fee() {
+        let mut env = valid_env();
+        env.insert("SET_PRICES_TX_FEE", "0".to_string());
+
+        let err = Config::from_lookup(|key| env.get(key).cloned()).unwrap_err();
+
+        assert!(matches!(
+            &err.0[0],
+            EnvError::InvalidVar {
+                var: "SET_PRICES_TX_FEE",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn config_from_lookup_rejects_zero_keeper_tx_fee() {
+        let mut env = valid_env();
+        env.insert("KEEPER_TX_FEE", "0".to_string());
+
+        let err = Config::from_lookup(|key| env.get(key).cloned()).unwrap_err();
+
+        assert!(matches!(
+            &err.0[0],
+            EnvError::InvalidVar {
+                var: "KEEPER_TX_FEE",
+                ..
+            }
+        ));
     }
 }
