@@ -1423,6 +1423,17 @@ async fn execute_handler(
                 // drop it so the next call re-fetches instead of retrying
                 // with the same wrong value.
                 *sequence_cache = None;
+            } else if matches!(&error, SubmitError::TransactionFailed { .. }) {
+                // The transaction landed on-chain and failed (contract error,
+                // insufficient fee, etc.) — the sequence was consumed, so the
+                // next call must use sequence + 1 rather than re-submitting
+                // with the same number (#1288).
+                *sequence_cache = Some(sequence + 1);
+            } else if matches!(&error, SubmitError::PollTimeout { .. }) {
+                // We don't know whether the transaction landed; clear the
+                // cache so the next call re-fetches the authoritative
+                // sequence from the network rather than guessing (#1288).
+                *sequence_cache = None;
             }
             Err(HandlerError::submitted(method, error))
         }

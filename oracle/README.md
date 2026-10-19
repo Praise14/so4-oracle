@@ -53,8 +53,22 @@ RUST_LOG=info cargo run --bin oracle
 curl http://127.0.0.1:8080/health
 ```
 
-Expected health response:
+Expected health response (fields added in #497; optional fields are omitted
+until the first price/keeper cycle completes):
 
 ```json
-{"status":"ok"}
+{
+  "status": "ok",
+  "last_price_cycle_secs_ago": 3,
+  "last_keeper_cycle_secs_ago": 5,
+  "price_cycle_count": 12,
+  "keeper_cycle_count": 8,
+  "token_fetch_failures": 0,
+  "submit_failures": 0
+}
 ```
+
+`last_price_cycle_secs_ago` and `last_keeper_cycle_secs_ago` are absent
+until the first cycle of each type completes. `status` is always `"ok"` on
+the `/health` path; use `/ready` for a liveness check that returns `503`
+while the initial price fetch is still pending.
