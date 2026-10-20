@@ -1,17 +1,22 @@
 use std::sync::Arc;
 
+use axum::body::Body;
 use axum::extract::FromRequestParts;
-use axum::extract::MatchedPath;
-use axum::http::header::AUTHORIZATION;
+use axum::extract::{ConnectInfo, MatchedPath};
+use axum::http::header::{AUTHORIZATION, CACHE_CONTROL};
 use axum::http::request::Parts;
-use axum::http::{Method, StatusCode};
+use axum::http::{HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{delete, get};
 use axum::{Json, Router};
 use serde::Serialize;
 use std::time::Duration;
+use tower::limit::ConcurrencyLimitLayer;
+use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
+use tower_http::set_header::SetResponseHeaderLayer;
+use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 use tracing::Span;
 
@@ -69,6 +74,20 @@ impl FromRequestParts<Arc<AppState>> for AdminAuth {
             )
         })?;
 
+        // Throttle brute-force attempts per client before comparing (#1214).
+        let client = parts
+            .extensions
+            .get::<ConnectInfo<std::net::SocketAddr>>()
+            .map(|ConnectInfo(addr)| addr.ip().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let now = std::time::Instant::now();
+        if state.admin_auth_limiter.is_blocked(&client, now) {
+            return Err(ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many failed admin auth attempts; try again later",
+            ));
+        }
+
         let actual = parts
             .headers
             .get(AUTHORIZATION)
@@ -76,10 +95,17 @@ impl FromRequestParts<Arc<AppState>> for AdminAuth {
             .and_then(|value| value.strip_prefix("Bearer "));
 
         match actual {
-            Some(actual) if constant_time_eq(actual.as_bytes(), expected.as_str().as_bytes()) => {
+            Some(actual)
+                if crate::auth::constant_time_eq(
+                    actual.as_bytes(),
+                    expected.as_str().as_bytes(),
+                ) =>
+            {
+                state.admin_auth_limiter.record_success(&client);
                 Ok(AdminAuth)
             }
             _ => {
+                state.admin_auth_limiter.record_failure(&client, now);
                 let route = parts
                     .extensions
                     .get::<MatchedPath>()
@@ -136,6 +162,27 @@ async fn track_metrics(
 
     response.extensions_mut().insert(RouteExt(path));
     response
+}
+
+/// Middleware that converts axum's bare 405 Method Not Allowed responses into
+/// the same `{"error": "..."}` JSON envelope this API returns for every other
+/// error path (#1029).
+async fn map_method_not_allowed(
+    request: axum::http::Request<Body>,
+    next: axum::middleware::Next,
+) -> Response {
+    let response = next.run(request).await;
+    if response.status() == StatusCode::METHOD_NOT_ALLOWED {
+        (
+            StatusCode::METHOD_NOT_ALLOWED,
+            Json(ErrorBody {
+                error: "method_not_allowed".to_string(),
+            }),
+        )
+            .into_response()
+    } else {
+        response
+    }
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {
@@ -207,45 +254,144 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/oracle/status", get(admin::oracle_status))
         .route("/keeper/status", get(admin::keeper_status))
         .route("/keeper/balance", get(admin::keeper_balance))
+        .route(
+            "/keeper/blacklist/{key}",
+            delete(admin::clear_blacklisted_key),
+        )
         .route("/metrics", get(admin::metrics))
         .route(
             "/oracle/failed-submissions",
             get(prices::failed_submissions),
         )
+        .fallback(|| async { ApiError::new(StatusCode::NOT_FOUND, "not_found") })
         .with_state(state.clone())
+        // #1044 — CatchPanicLayer must be the OUTERMOST layer so it wraps
+        // every handler. With `panic = "abort"` in the release profile a
+        // panicking handler would otherwise abort the entire process; this
+        // layer converts panics into 500 responses instead, isolating faults
+        // to the offending request.
+        .layer(CatchPanicLayer::new())
+        // Layer ordering: `.layer()` calls chained directly on a `Router` make
+        // the LAST-added layer the OUTERMOST — it sees the request first. So
+        // `SetRequestIdLayer` must be added *after* `trace_layer` for the ID
+        // to be in the request extensions by the time `trace_layer`'s
+        // `make_span_with` reads it; otherwise every span's `request_id` is
+        // "" (#790). `PropagateRequestIdLayer` only needs to run after the
+        // handler, so it stays innermost.
         .layer(PropagateRequestIdLayer::x_request_id())
-        .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
         .layer(trace_layer)
+        .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
         .layer(axum::middleware::from_fn_with_state(state, track_metrics))
-}
-
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    let max_len = left.len().max(right.len());
-    let mut diff = left.len() ^ right.len();
-
-    for index in 0..max_len {
-        let a = left.get(index).copied().unwrap_or(0);
-        let b = right.get(index).copied().unwrap_or(0);
-        diff |= (a ^ b) as usize;
-    }
-
-    diff == 0
+        // No response from this service is meant to be cached — /prices is
+        // the one endpoint explicitly CORS-enabled for direct browser
+        // access, updates roughly once a second, and backs a trading
+        // frontend, so a response with no cache directives at all is
+        // otherwise subject to whatever default heuristics a browser,
+        // proxy, or CDN in front of this service chooses to apply (#1026).
+        // Applied to every route, not just /prices, since nothing here is
+        // cacheable.
+        .layer(SetResponseHeaderLayer::overriding(
+            CACHE_CONTROL,
+            HeaderValue::from_static("no-store"),
+        ))
+        .layer(axum::middleware::from_fn(map_method_not_allowed))
+        // Request timeout: return 408 if a handler takes longer than 30 s
+        // (#1259). Applied outside the trace layer so the span captures the
+        // timeout as a 408, not as an internal server error.
+        .layer(TimeoutLayer::new(Duration::from_secs(30)))
+        // Hard cap on concurrent requests (#1259). Excess requests receive
+        // 503 immediately rather than queuing, keeping /health and /ready
+        // reachable even under load. 512 is well above a single Fly machine's
+        // realistic per-instance concurrency while still bounding memory.
+        .layer(ConcurrencyLimitLayer::new(512))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::constant_time_eq;
     use crate::{AppState, Config};
     use axum::body::Body;
-    use axum::http::Request;
+    use axum::http::header::CACHE_CONTROL;
+    use axum::http::{Request, StatusCode};
     use std::sync::Arc;
     use tower::ServiceExt;
 
-    #[test]
-    fn constant_time_comparison_matches_equal_values_only() {
-        assert!(constant_time_eq(b"secret", b"secret"));
-        assert!(!constant_time_eq(b"secret", b"Secret"));
-        assert!(!constant_time_eq(b"secret", b"secret2"));
+    // #1026 — every response, not just /prices, must carry an explicit
+    // no-store directive so no browser/proxy/CDN in front of this service
+    // applies default caching heuristics to a price that updates ~1/sec.
+    #[tokio::test]
+    async fn every_response_sets_cache_control_no_store() {
+        let config = Arc::new(Config::default_for_tests());
+        let state = Arc::new(AppState::new(config));
+        let app = super::build_router(state);
+
+        for uri in ["/health", "/ready", "/prices"] {
+            let request = Request::builder().uri(uri).body(Body::empty()).unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(
+                response
+                    .headers()
+                    .get(CACHE_CONTROL)
+                    .map(|v| v.to_str().unwrap()),
+                Some("no-store"),
+                "missing/incorrect Cache-Control on {uri}"
+            );
+        }
+    }
+
+    // #1214 — repeated wrong admin tokens from one client are throttled with
+    // 429 (even if the next attempt is correct), until the window resets.
+    #[tokio::test]
+    async fn admin_auth_throttles_repeated_failures() {
+        let mut config = Config::default_for_tests();
+        let token = "t".repeat(crate::config::MIN_ADMIN_API_TOKEN_LEN);
+        config.admin_api_token = Some(crate::config::SecretString::new(token.clone()));
+        let state = Arc::new(AppState::new(Arc::new(config)));
+        let app = super::build_router(state);
+
+        let call = |bearer: String| {
+            let app = app.clone();
+            async move {
+                let request = Request::builder()
+                    .uri("/oracle/failed-submissions")
+                    .header("Authorization", format!("Bearer {bearer}"))
+                    .body(Body::empty())
+                    .unwrap();
+                app.oneshot(request).await.unwrap().status()
+            }
+        };
+
+        for _ in 0..crate::state::MAX_ADMIN_AUTH_FAILURES {
+            assert_eq!(call("wrong".to_string()).await, StatusCode::UNAUTHORIZED);
+        }
+        assert_eq!(
+            call("wrong".to_string()).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(call(token).await, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    // #1029 — a wrong HTTP method on a known route must return the API's JSON
+    // error envelope, not axum's bare 405.
+    #[tokio::test]
+    async fn method_not_allowed_returns_json_envelope() {
+        let config = Arc::new(Config::default_for_tests());
+        let state = Arc::new(AppState::new(config));
+        let app = super::build_router(state);
+
+        // POST to /prices (which only accepts GET) should return 405 with JSON body
+        let request = Request::builder()
+            .method("POST")
+            .uri("/prices")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "method_not_allowed");
     }
 
     #[tokio::test]
@@ -261,10 +407,10 @@ mod tests {
         let state = Arc::new(AppState::new(Arc::new(config)));
         let app = super::build_router(Arc::clone(&state));
 
-        // Make an unauthorized admin request
-        let _request = Request::builder()
+        // Make both successful and failing admin requests to test that secrets don't leak in either case
+        let successful_request = Request::builder()
             .uri("/oracle/status")
-            .header("Authorization", format!("Bearer {}", test_admin_token)) // wait, we want a failing one to check auth failure metrics
+            .header("Authorization", format!("Bearer {}", test_admin_token))
             .body(Body::empty())
             .unwrap();
 
@@ -274,6 +420,8 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
+        // Send both requests
+        let _ = app.clone().oneshot(successful_request).await;
         let _ = app.clone().oneshot(failing_request).await;
 
         let metrics_out = state.metrics.to_prometheus();

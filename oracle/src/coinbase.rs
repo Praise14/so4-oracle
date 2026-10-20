@@ -43,20 +43,20 @@ impl std::error::Error for CoinbasePriceError {}
 impl crate::retry::Retryable for CoinbasePriceError {
     fn is_retryable(&self) -> bool {
         match self {
-            // Network errors and 5xx HTTP errors are transient
+            // Network errors, 5xx HTTP errors, and 429 rate limits are
+            // transient. Coinbase rate-limits aggressively and signals it
+            // with 429, which is < 500 and would otherwise be classified as a
+            // permanent failure — giving up on the source for the rest of the
+            // cycle instead of backing off (#708). Matches RpcError's
+            // classification in stellar_rpc.rs.
             Self::NetworkError(_) => true,
-            Self::HttpError { status, .. } => *status >= 500,
+            Self::HttpError { status, .. } => *status >= 500 || *status == 429,
             // Parse/JSON/config errors are permanent failures
             Self::JsonError(_) | Self::PriceParseError(_) | Self::MissingUsdRate => false,
             // Currency mismatch should not be retried - it's a data integrity issue
             Self::CurrencyMismatch { .. } => false,
         }
     }
-}
-
-#[derive(Debug, Deserialize)]
-pub struct CoinbaseRates {
-    pub rates: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -91,12 +91,25 @@ pub fn parse_coinbase_response_body(
         .get("USD")
         .ok_or(CoinbasePriceError::MissingUsdRate)?;
 
-    // We can reuse the precision parsing from binance, but map the error
+    // We reuse the precision parsing from binance, remapping its error.
+    // `parse_price_to_precision` is a pure parser: every one of its error
+    // paths returns `BinancePriceError::PriceParseError`. The network/HTTP/JSON
+    // variants only ever come from binance's HTTP-fetch functions, which this
+    // module never calls — so the catch-all arm below is unreachable and only
+    // exists to keep the match exhaustive. `debug_assert` makes it loud if
+    // that contract is ever widened without updating this call site (#704).
     crate::binance::parse_price_to_precision(usd_price_str).map_err(|err| match err {
         crate::binance::BinancePriceError::PriceParseError(msg) => {
             CoinbasePriceError::PriceParseError(msg)
         }
-        _ => CoinbasePriceError::PriceParseError("unknown parse error".to_string()),
+        other => {
+            debug_assert!(
+                false,
+                "binance::parse_price_to_precision returned a non-parse error: {other:?} — \
+                 its error contract widened; update this remap",
+            );
+            CoinbasePriceError::PriceParseError(format!("unexpected parse error: {other:?}"))
+        }
     })
 }
 
@@ -177,6 +190,39 @@ pub(crate) async fn fetch_spot_price_with_url(
 mod tests {
     use super::*;
     use crate::binance::FLOAT_PRECISION;
+    use crate::retry::Retryable;
+
+    // #708 — a 429 from Coinbase means "slow down", not "give up". It must be
+    // retried with backoff instead of being classified as a permanent failure.
+    #[test]
+    fn http_error_429_is_retryable() {
+        let err = CoinbasePriceError::HttpError {
+            status: 429,
+            body: "rate limit exceeded".to_string(),
+        };
+        assert!(err.is_retryable());
+    }
+
+    #[test]
+    fn http_error_5xx_is_retryable_and_4xx_is_not() {
+        for status in [500, 502, 503] {
+            let err = CoinbasePriceError::HttpError {
+                status,
+                body: String::new(),
+            };
+            assert!(err.is_retryable(), "status {status} should be retryable");
+        }
+        for status in [400, 401, 404] {
+            let err = CoinbasePriceError::HttpError {
+                status,
+                body: String::new(),
+            };
+            assert!(
+                !err.is_retryable(),
+                "status {status} should not be retryable"
+            );
+        }
+    }
 
     #[test]
     fn test_parse_coinbase_response_body_success() {
@@ -638,5 +684,50 @@ mod tests {
             err,
             CoinbasePriceError::HttpError { status: 500, .. }
         ));
+    }
+
+    /// #706 — every other HTTP test builds `base_url` as `"{uri}/"`, which
+    /// contains neither `"currency="` nor `"exchange-rates"`, so they all
+    /// exercise the `use_query = false` (`format!`-concatenated) branch that
+    /// production never takes. The real `COINBASE_EXCHANGE_RATES_URL` shape
+    /// (`.../v2/exchange-rates?currency=`) drives `use_query = true` — the
+    /// `reqwest .query()` path. This test covers that branch at the HTTP
+    /// level: `?currency=` is trimmed, and the currency arrives as a real
+    /// query parameter.
+    #[tokio::test]
+    async fn fetch_spot_price_production_url_shape_uses_query_param_branch() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let body = r#"{
+            "data": {
+                "currency": "BTC",
+                "rates": { "USD": "50000.0" }
+            }
+        }"#;
+
+        Mock::given(method("GET"))
+            .and(path("/v2/exchange-rates"))
+            .and(query_param("currency", "BTC"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(body, "application/json"))
+            .mount(&server)
+            .await;
+
+        // Same shape as the real COINBASE_EXCHANGE_RATES_URL constant.
+        let base_url = format!("{}/v2/exchange-rates?currency=", server.uri());
+        let result = super::fetch_spot_price_with_url(&base_url, "BTCUSDT")
+            .await
+            .unwrap();
+        assert_eq!(result, 50000 * FLOAT_PRECISION);
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].url.path(), "/v2/exchange-rates");
+        assert_eq!(
+            requests[0].url.query(),
+            Some("currency=BTC"),
+            "currency must be sent as a query parameter, not concatenated into the path"
+        );
     }
 }

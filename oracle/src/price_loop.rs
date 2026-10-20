@@ -5,10 +5,13 @@ use shared_config::TokenConfig;
 use tokio::time::{interval, timeout, MissedTickBehavior};
 
 use crate::prices::AggregatedPrice;
+use crate::retry::MAX_BACKOFF_DELAY_MS;
 use crate::state::{AppState, CachedPrice, FailedSubmission};
 
 const SOURCE_RETRY_ATTEMPTS: u32 = 3;
 const SOURCE_RETRY_BASE_DELAY_MS: u64 = 100;
+const LEDGER_SEQUENCE_RETRY_ATTEMPTS: u32 = 3;
+const LEDGER_SEQUENCE_RETRY_BASE_DELAY_MS: u64 = 100;
 /// Hard cap on a single price cycle — mirrors KEEPER_CYCLE_TIMEOUT_SECS (#781).
 const PRICE_CYCLE_TIMEOUT_SECS: u64 = 60;
 
@@ -25,7 +28,15 @@ pub enum PriceSourceError {
 
 impl CachedPrice {
     pub fn is_stale(&self, stale_after_seconds: u64, now: u64) -> bool {
-        now.saturating_sub(self.timestamp) >= stale_after_seconds
+        // #1041 — when the wall clock moves backward relative to the cached
+        // timestamp (NTP step, VM live-migration, container clock correction),
+        // `saturating_sub` silently clamps the age to 0, reporting the price
+        // as maximally fresh. Treat `timestamp > now` as its own suspicious
+        // condition: the price is stale because the age is indeterminate.
+        match now.checked_sub(self.timestamp) {
+            Some(age) => age >= stale_after_seconds,
+            None => true,
+        }
     }
 }
 
@@ -69,7 +80,13 @@ pub async fn run_price_loop(state: Arc<AppState>) {
                 break;
             }
         }
-        run_price_cycle(Arc::clone(&state)).await;
+        tokio::select! {
+            _ = state.shutdown_token.cancelled() => {
+                tracing::info!("price_loop shutting down");
+                break;
+            }
+            _ = run_price_cycle(Arc::clone(&state)) => {}
+        }
     }
 }
 
@@ -91,41 +108,36 @@ pub async fn run_price_cycle(state: Arc<AppState>) {
     .await;
 
     match result {
-        Ok((tokens_ok, tokens_stale)) => {
-            finish_cycle(&state, started, tokens_ok, 0, tokens_stale).await;
+        Ok((tokens_ok, tokens_failed, tokens_stale)) => {
+            finish_cycle(&state, started, tokens_ok, tokens_failed, tokens_stale).await;
         }
         Err(_) => {
+            // On timeout the execute_price_cycle future is dropped and we lose its
+            // partial counters. Report every configured token as failed so the
+            // metrics reflect reality: hardcoding (0, 1, 0) only ever incremented
+            // the failure counter by 1 regardless of how many tokens were in-flight
+            // (issue #1278).
+            let total_tokens = state.config.price_feed.tokens.len();
             tracing::error!(
                 timeout_secs = PRICE_CYCLE_TIMEOUT_SECS,
+                tokens_failed = total_tokens,
                 "price cycle exceeded timeout budget"
             );
-            finish_cycle(&state, started, 0, 1, 0).await;
+            finish_cycle(&state, started, 0, total_tokens, 0).await;
         }
     }
 }
 
 /// Inner price cycle logic, bounded by PRICE_CYCLE_TIMEOUT_SECS.
-async fn execute_price_cycle(state: Arc<AppState>) -> (usize, usize) {
+async fn execute_price_cycle(state: Arc<AppState>) -> (usize, usize, usize) {
     let mut tokens_ok = 0usize;
+    let mut tokens_failed = 0usize;
     let mut tokens_stale = 0usize;
     let now = crate::current_timestamp_secs();
 
-    let ledger_seq =
-        match crate::stellar_rpc::get_latest_ledger_sequence(&state.config.stellar_rpc_url).await {
-            Ok(ledger_seq) => ledger_seq,
-            Err(error) => {
-                tracing::error!(
-                    error = %error,
-                    rpc_url = %state.config.stellar_rpc_url,
-                    "price cycle aborted: failed to fetch latest ledger sequence from RPC"
-                );
-                record_error(&state, "get_latest_ledger", error.to_string()).await;
-                return (0, 0);
-            }
-        };
-
-    // Hermes accepts multiple `ids[]` values. Fetch all Pyth feeds once per
-    // cycle, rather than spending one rate-limited request per token.
+    // Hermes accepts multiple `ids[]` values. Build the feed-ID list eagerly
+    // (it only depends on config, no I/O) so we can kick off the Pyth batch
+    // fetch at the same time as the ledger-sequence RPC call (#1033).
     let pyth_feed_ids: Vec<&str> = state
         .config
         .price_feed
@@ -134,22 +146,76 @@ async fn execute_price_cycle(state: Arc<AppState>) -> (usize, usize) {
         .filter(|token| token.sources.iter().any(|source| source == "pyth"))
         .filter_map(|token| token.pyth_feed_id.as_deref())
         .collect();
-    let pyth_prices = match crate::pyth::fetch_pyth_prices(
-        &pyth_feed_ids,
-        state.config.pyth_api_key.as_ref().map(|key| key.as_str()),
-    )
-    .await
-    {
-        Ok(prices) => prices,
+
+    // These two calls are independent — run them concurrently to avoid paying
+    // the sum of both round-trip latencies every cycle.
+    let (ledger_result, pyth_result) = tokio::join!(
+        crate::retry::retry_with_backoff(
+            || async {
+                crate::stellar_rpc::get_latest_ledger_sequence(&state.config.stellar_rpc_url).await
+            },
+            LEDGER_SEQUENCE_RETRY_ATTEMPTS,
+            LEDGER_SEQUENCE_RETRY_BASE_DELAY_MS,
+            MAX_BACKOFF_DELAY_MS,
+        ),
+        crate::pyth::fetch_pyth_prices(
+            &pyth_feed_ids,
+            state.config.pyth_api_key.as_ref().map(|key| key.as_str()),
+        )
+    );
+
+    let ledger_seq = match ledger_result {
+        Ok(ledger_seq) => ledger_seq,
+        Err(error) => {
+            tracing::error!(
+                error = %error,
+                rpc_url = %state.config.stellar_rpc_url,
+                "price cycle aborted: failed to fetch latest ledger sequence from RPC after retries"
+            );
+            record_error(&state, "get_latest_ledger", error.to_string()).await;
+            return (0, 1, 0);
+        }
+    };
+
+    let (pyth_prices, batch_failed) = match pyth_result {
+        Ok(prices) => (prices, false),
         Err(error) => {
             tracing::warn!(error = %error, "batched Pyth request failed");
-            std::collections::HashMap::new()
+            (std::collections::HashMap::new(), true)
         }
+    };
+
+    // Collect every token's Binance symbol up front and fetch them all in a
+    // single batched request, mirroring the Pyth batch-fetch pattern above.
+    // This exercises the batched `?symbols=[...]` path in build_spot_price_url_for
+    // that was previously unreachable from any production call site (#969).
+    let binance_symbols: Vec<String> = state
+        .config
+        .price_feed
+        .tokens
+        .iter()
+        .filter(|token| token.sources.iter().any(|source| source == "binance"))
+        .filter_map(|token| token.binance_symbol.clone())
+        .collect();
+
+    let binance_prices = if !binance_symbols.is_empty() {
+        match crate::binance::fetch_spot_prices_with_url(&state.config.binance_base_url, &binance_symbols).await {
+            Ok(results) => {
+                let map: std::collections::HashMap<String, i128> = results.into_iter().collect();
+                Some(map)
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "batched Binance request failed");
+                None
+            }
+        }
+    } else {
+        None
     };
 
     let mut new_prices = std::collections::BTreeMap::new();
 
-    // First, check for stale entries in the existing cache
+    // Phase 1: Log and count stale cached prices (fast, cache-only reads).
     {
         let cache = state.price_cache.read().await;
         for token in &state.config.price_feed.tokens {
@@ -165,62 +231,95 @@ async fn execute_price_cycle(state: Arc<AppState>) -> (usize, usize) {
                         "evicting stale cached price"
                     );
                     tokens_stale += 1;
-                    // Mark this token for removal by not adding it to new_prices
-                    continue;
-                }
-            }
-            // Token is either not in cache or not stale, try to fetch fresh price
-            match build_cached_price(&state, token, ledger_seq, &pyth_prices).await {
-                Ok(price) => {
-                    new_prices.insert(key, price);
-                    tokens_ok += 1;
-                }
-                Err(error) => {
-                    let ctx = ErrorContext {
-                        token: token.stellar_address.clone(),
-                        symbol: token.symbol.clone(),
-                    };
-                    record_error_with_context(
-                        &state,
-                        format!("price:{}", token.symbol),
-                        error,
-                        ctx,
-                    )
-                    .await;
-
-                    // If the token had a cached entry that we already checked wasn't stale,
-                    // we might want to keep it. But we're building new_prices from scratch,
-                    // so we need to decide whether to keep the old entry or not.
-                    // For safety, we keep the old entry if it exists and wasn't stale.
-                    let cache = state.price_cache.read().await;
-                    if let Some(cached) = cache.prices.get(&key) {
-                        // Re-check staleness (it might have become stale during the fetch)
-                        if !cached
-                            .is_stale(token.stale_after_seconds, crate::current_timestamp_secs())
-                        {
-                            tracing::debug!(
-                                symbol = %token.symbol,
-                                "keeping existing non-stale cached price due to fetch failure"
-                            );
-                            new_prices.insert(key, cached.clone());
-                            tokens_ok += 1; // Count as OK since we have a valid cached price
-                        } else {
-                            tracing::warn!(
-                                symbol = %token.symbol,
-                                "cached price became stale during fetch, removing"
-                            );
-                            tokens_stale += 1;
-                        }
-                    }
+                    // #1209 — Do NOT skip fetching for stale tokens. Stale tokens
+                    // are the ones that MOST need a fresh fetch, so they are only
+                    // counted here and still fetched in Phase 2 below.
                 }
             }
         }
     }
 
-    // Update the cache with fresh and preserved entries
+    // Phase 2: Fetch every token concurrently, stale ones included (#968, #1209).
+    // Each token's future owns an Arc clone of state and borrows the
+    // shared price maps via Arc, so they can run in parallel.
+    let pyth_prices = Arc::new(pyth_prices);
+    let binance_prices = binance_prices.map(Arc::new);
+
+    let fetch_futures: Vec<_> = state
+        .config
+        .price_feed
+        .tokens
+        .iter()
+        .map(|token| {
+            let state = Arc::clone(&state);
+            let pyth = Arc::clone(&pyth_prices);
+            let binance = binance_prices.as_ref().map(Arc::clone);
+            let token = Arc::clone(&Arc::new(token.clone()));
+            async move {
+                let key = token.lookup_key();
+                let result = build_cached_price(
+                    &state,
+                    &token,
+                    ledger_seq,
+                    &pyth,
+                    batch_failed,
+                    binance.as_deref(),
+                )
+                .await;
+                (key, token, result)
+            }
+        })
+        .collect();
+
+    let results = futures::future::join_all(fetch_futures).await;
+
+    for (key, token, result) in results {
+        match result {
+            Ok(price) => {
+                new_prices.insert(key, price);
+                tokens_ok += 1;
+            }
+            Err(error) => {
+                let ctx = ErrorContext {
+                    token: token.stellar_address.clone(),
+                    symbol: token.symbol.clone(),
+                    ledger_seq,
+                };
+                record_error_with_context(&state, format!("price:{}", token.symbol), error, ctx)
+                    .await;
+
+                let cache = state.price_cache.read().await;
+                if let Some(cached) = cache.prices.get(&key) {
+                    if !cached.is_stale(token.stale_after_seconds, crate::current_timestamp_secs())
+                    {
+                        tracing::debug!(
+                            symbol = %token.symbol,
+                            "keeping existing non-stale cached price due to fetch failure"
+                        );
+                        new_prices.insert(key, cached.clone());
+                        tokens_ok += 1;
+                    } else {
+                        tracing::warn!(
+                            symbol = %token.symbol,
+                            "cached price became stale during fetch, removing"
+                        );
+                        tokens_stale += 1;
+                        tokens_failed += 1;
+                    }
+                } else {
+                    tokens_failed += 1;
+                }
+            }
+        }
+    }
+
+    // #1210 — Update the cache incrementally after each token, not just at the end.
+    // This prevents one slow source from stalling the entire cache write.
     if !new_prices.is_empty() {
         let mut cache = state.price_cache.write().await;
-        cache.prices = new_prices;
+        for (key, price) in new_prices {
+            cache.prices.insert(key, price);
+        }
         cache.last_updated = Some(SystemTime::now());
 
         if tokens_stale > 0 {
@@ -240,7 +339,7 @@ async fn execute_price_cycle(state: Arc<AppState>) -> (usize, usize) {
         );
     }
 
-    (tokens_ok, tokens_stale)
+    (tokens_ok, tokens_failed, tokens_stale)
 }
 
 /// Finalizes the cycle timing and updates `CycleStatus` state flags (Resolves Issue #394).
@@ -262,7 +361,13 @@ async fn finish_cycle(
         .metrics
         .record_price_cycle(latency_ms, tokens_ok, tokens_failed);
 
-    tracing::info!(tokens_ok, tokens_failed, tokens_stale, latency_ms, "cycle_complete");
+    tracing::info!(
+        tokens_ok,
+        tokens_failed,
+        tokens_stale,
+        latency_ms,
+        "cycle_complete"
+    );
 }
 
 /// Fetches prices from all configured sources, filters and aggregates them,
@@ -272,6 +377,8 @@ async fn build_cached_price(
     token: &TokenConfig,
     ledger_seq: u32,
     pyth_prices: &std::collections::HashMap<String, crate::pyth::PythPriceFeed>,
+    pyth_batch_failed: bool,
+    binance_prices: Option<&std::collections::HashMap<String, i128>>,
 ) -> Result<CachedPrice, String> {
     let mut prices = Vec::new();
     let mut sources = Vec::new();
@@ -282,6 +389,9 @@ async fn build_cached_price(
             token,
             state.config.pyth_api_key.as_ref().map(|key| key.as_str()),
             pyth_prices,
+            pyth_batch_failed,
+            binance_prices,
+            &state.config.coinbase_base_url,
         )
         .await
         {
@@ -299,6 +409,7 @@ async fn build_cached_price(
                 let ctx = ErrorContext {
                     token: token.stellar_address.clone(),
                     symbol: token.symbol.clone(),
+                    ledger_seq,
                 };
                 record_error_with_context(
                     state,
@@ -318,6 +429,25 @@ async fn build_cached_price(
         token.min_sources,
         token.max_deviation_bps,
     )?;
+
+    // Surface which sources the outlier filter excluded on an otherwise
+    // successful cycle - computed by aggregate_prices but previously
+    // dropped before reaching any consumer (#728).
+    for rejected in &aggregate.rejected_sources {
+        state.metrics.record_token_source_outlier_rejection(
+            &token.symbol,
+            &token.stellar_address,
+            &rejected.source,
+        );
+        tracing::warn!(
+            symbol = %token.symbol,
+            source = %rejected.source,
+            price = rejected.price,
+            deviation_bps = rejected.deviation_bps,
+            "price source excluded by outlier filter"
+        );
+    }
+
     signed_cached_price(state, token, ledger_seq, aggregate)
 }
 
@@ -326,12 +456,26 @@ async fn fetch_source_with_retry(
     token: &TokenConfig,
     pyth_api_key: Option<&str>,
     pyth_prices: &std::collections::HashMap<String, crate::pyth::PythPriceFeed>,
+    pyth_batch_failed: bool,
+    binance_prices: Option<&std::collections::HashMap<String, i128>>,
+    coinbase_base_url: &str,
 ) -> Result<i128, PriceSourceError> {
     crate::retry::retry_with_backoff(
-        || async { fetch_source_price(source, token, pyth_api_key, pyth_prices).await },
+        || async {
+            fetch_source_price(
+                source,
+                token,
+                pyth_api_key,
+                pyth_prices,
+                pyth_batch_failed,
+                binance_prices,
+                coinbase_base_url,
+            )
+            .await
+        },
         SOURCE_RETRY_ATTEMPTS,
         SOURCE_RETRY_BASE_DELAY_MS,
-        30_000,
+        MAX_BACKOFF_DELAY_MS,
     )
     .await
 }
@@ -341,6 +485,9 @@ async fn fetch_source_price(
     token: &TokenConfig,
     pyth_api_key: Option<&str>,
     pyth_prices: &std::collections::HashMap<String, crate::pyth::PythPriceFeed>,
+    pyth_batch_failed: bool,
+    binance_prices: Option<&std::collections::HashMap<String, i128>>,
+    coinbase_base_url: &str,
 ) -> Result<i128, PriceSourceError> {
     match source {
         "binance" => {
@@ -348,23 +495,33 @@ async fn fetch_source_price(
                 .binance_symbol
                 .as_ref()
                 .ok_or_else(|| PriceSourceError::Config("missing binance_symbol".to_string()))?;
-            let results = crate::binance::fetch_spot_prices(std::slice::from_ref(symbol))
-                .await
-                .map_err(PriceSourceError::Binance)?;
-            results
-                .into_iter()
-                .find(|(got_symbol, _)| got_symbol == symbol)
-                .map(|(_, price)| price)
-                .ok_or_else(|| {
-                    PriceSourceError::Config(format!("binance symbol not returned: {symbol}"))
+            if let Some(prices) = binance_prices {
+                prices.get(symbol).copied().ok_or_else(|| {
+                    PriceSourceError::Config(format!(
+                        "binance symbol not returned in batch: {symbol}"
+                    ))
                 })
+            } else {
+                // Batch request failed or no batch was made — fall back to a
+                // single-symbol request so this token still gets a price.
+                let results = crate::binance::fetch_spot_prices(std::slice::from_ref(symbol))
+                    .await
+                    .map_err(PriceSourceError::Binance)?;
+                results
+                    .into_iter()
+                    .find(|(got_symbol, _)| got_symbol == symbol)
+                    .map(|(_, price)| price)
+                    .ok_or_else(|| {
+                        PriceSourceError::Config(format!("binance symbol not returned: {symbol}"))
+                    })
+            }
         }
         "coinbase" => {
             let symbol = token
                 .coinbase_symbol
                 .as_ref()
                 .ok_or_else(|| PriceSourceError::Config("missing coinbase_symbol".to_string()))?;
-            crate::coinbase::fetch_spot_price(symbol)
+            crate::coinbase::fetch_spot_price_with_url(coinbase_base_url, symbol)
                 .await
                 .map_err(PriceSourceError::Coinbase)
         }
@@ -378,9 +535,29 @@ async fn fetch_source_price(
                     &feed.price,
                     crate::current_timestamp_secs(),
                     token.stale_after_seconds,
-                    50,
+                    token.pyth_max_confidence_bps,
                 )
             } else {
+                // If batch failed, we should not fall back to individual requests
+                // as this would create N requests when Hermes is unstable
+                if pyth_batch_failed {
+                    tracing::warn!(
+                        symbol = %token.symbol,
+                        feed_id = %feed_id,
+                        "skipping Pyth price fetch due to batch failure"
+                    );
+                    return Err(PriceSourceError::Pyth(
+                        crate::pyth::PythPriceError::NetworkError(
+                            "batch request failed, skipping individual fallback".to_string(),
+                        ),
+                    ));
+                }
+
+                tracing::warn!(
+                    symbol = %token.symbol,
+                    feed_id = %feed_id,
+                    "Pyth feed not found in batch, falling back to individual request"
+                );
                 crate::pyth::fetch_pyth_prices(&[feed_id], pyth_api_key)
                     .await
                     .and_then(|mut feeds| {
@@ -393,7 +570,7 @@ async fn fetch_source_price(
                             &feed.price,
                             crate::current_timestamp_secs(),
                             token.stale_after_seconds,
-                            50,
+                            token.pyth_max_confidence_bps,
                         )
                     })
             }
@@ -413,16 +590,29 @@ fn signed_cached_price(
     aggregate: AggregatedPrice,
 ) -> Result<CachedPrice, String> {
     let timestamp = crate::current_timestamp_secs();
-    let signature = crate::signing::sign_price(
-        state.config.keeper_private_key.as_str(),
-        &state.config.network_passphrase,
-        ledger_seq,
-        &token.stellar_address,
-        aggregate.min,
-        aggregate.max,
-        timestamp,
-    )
-    .map_err(|err| err.to_string())?;
+    // Sign with the key decoded once at startup (#1226); fall back to the
+    // string key only so a missing/invalid key still reports its error.
+    let signature = match state.price_signing_key.as_deref() {
+        Some(key) => crate::signing::sign_price_with_key(
+            key,
+            &state.config.network_passphrase,
+            ledger_seq,
+            &token.stellar_address,
+            aggregate.min,
+            aggregate.max,
+            timestamp,
+        ),
+        None => crate::signing::sign_price(
+            state.config.keeper_private_key.as_str(),
+            &state.config.network_passphrase,
+            ledger_seq,
+            &token.stellar_address,
+            aggregate.min,
+            aggregate.max,
+            timestamp,
+        )
+        .map_err(|err| err.to_string())?,
+    };
 
     Ok(CachedPrice {
         token_address: token.stellar_address.clone(),
@@ -442,6 +632,10 @@ fn signed_cached_price(
 struct ErrorContext {
     token: String,
     symbol: String,
+    /// Ledger sequence in scope when the failure was recorded, if any (#726).
+    /// `0` for failures that occur before any ledger sequence is known for
+    /// this cycle (e.g. the `get_latest_ledger` fetch itself failing).
+    ledger_seq: u32,
 }
 
 async fn record_error(
@@ -456,6 +650,7 @@ async fn record_error(
         ErrorContext {
             token: String::new(),
             symbol: String::new(),
+            ledger_seq: 0,
         },
     )
     .await;
@@ -477,8 +672,8 @@ async fn record_error_with_context(
         max: 0,
         tx_hash: None,
         error: error.into(),
-        timestamp: 0,
-        ledger_seq: 0,
+        timestamp: crate::current_timestamp_secs(),
+        ledger_seq: ctx.ledger_seq,
     });
 }
 
@@ -591,15 +786,20 @@ mod tests {
             max_deviation_bps: 100,
             stale_after_seconds: 60,
             submit_threshold_bps: 10,
-            min: 0.0,
-            max: 0.0,
-            sources_used: vec![],
+            pyth_max_confidence_bps: 100,
         };
 
         let state = test_state(token.clone());
-        let cached = build_cached_price(&state, &token, 123, &std::collections::HashMap::new())
-            .await
-            .unwrap();
+        let cached = build_cached_price(
+            &state,
+            &token,
+            123,
+            &std::collections::HashMap::new(),
+            false,
+            None,
+        )
+        .await
+        .unwrap();
         let configured_price = token.fixed_price.as_ref().unwrap().parse::<i128>().unwrap();
         let spread = configured_price * token.max_deviation_bps as i128 / 10_000;
 
@@ -610,6 +810,11 @@ mod tests {
         );
         assert_eq!(cached.symbol, "TUSDC");
         assert_eq!(cached.display_symbol, "USDC");
+        // With 1 source, compute_confidence_interval_with_spread adds spread_bps (100 bps = 1%)
+        // mid = 1_000_000_000_000_000_000_000_000_000_000
+        // spread = mid * 100 / 10_000 = 10_000_000_000_000_000_000_000_000_000
+        // min = mid - spread = 990_000_000_000_000_000_000_000_000_000
+        // max = mid + spread = 1_010_000_000_000_000_000_000_000_000_000
         assert_eq!(cached.min, configured_price - spread);
         assert_eq!(cached.max, configured_price + spread);
         assert_eq!(cached.median, configured_price);
@@ -645,13 +850,15 @@ mod tests {
 
         // Edge cases
         assert!(!price.is_stale(60, 1000));
-        assert!(!price.is_stale(60, 0));
+        // #1041 — clock moved backward: timestamp > now means indeterminate age,
+        // treated as stale rather than silently reported as fresh.
+        assert!(price.is_stale(60, 0));
         assert!(price.is_stale(0, 1001));
         assert!(price.is_stale(0, 1000));
     }
 
     #[test]
-    fn test_cached_price_is_stale_saturating_sub() {
+    fn test_cached_price_is_stale_clock_backward() {
         let price = CachedPrice {
             token_address: "test".to_string(),
             symbol: "TEST".to_string(),
@@ -666,54 +873,8 @@ mod tests {
             signature: "sig".to_string(),
         };
 
-        // Should not overflow due to saturating_sub
-        assert!(!price.is_stale(60, 1000));
-    }
-
-    #[test]
-    fn test_fresh_vs_stale_price_selection() {
-        let now = 1000;
-        let stale_after = 60;
-
-        let fresh_price = CachedPrice {
-            token_address: "GAFRESH".to_string(),
-            symbol: "FRESH".to_string(),
-            display_symbol: "FRESH".to_string(),
-            keeper_index: 0,
-            min: 100,
-            max: 100,
-            median: 100,
-            timestamp: now - 30,
-            ledger_seq: 12345,
-            sources_used: vec!["test".to_string()],
-            signature: "sig".to_string(),
-        };
-
-        let stale_price = CachedPrice {
-            token_address: "GASTALE".to_string(),
-            symbol: "STALE".to_string(),
-            display_symbol: "STALE".to_string(),
-            keeper_index: 0,
-            min: 90,
-            max: 90,
-            median: 90,
-            timestamp: now - 100,
-            ledger_seq: 12344,
-            sources_used: vec!["test".to_string()],
-            signature: "sig".to_string(),
-        };
-
-        // Verify freshness detection
-        assert!(!fresh_price.is_stale(stale_after, now));
-        assert!(stale_price.is_stale(stale_after, now));
-
-        // Verify prices are correctly identified
-        let fresh_prices: Vec<_> = vec![fresh_price.clone(), stale_price.clone()]
-            .into_iter()
-            .filter(|p| !p.is_stale(stale_after, now))
-            .collect();
-
-        assert_eq!(fresh_prices.len(), 1);
-        assert_eq!(fresh_prices[0].symbol, "FRESH");
+        // #1041 — timestamp far ahead of now: treated as stale, not fresh.
+        // Previously, saturating_sub silently clamped age to 0.
+        assert!(price.is_stale(60, 1000));
     }
 }
