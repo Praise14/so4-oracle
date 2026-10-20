@@ -1222,6 +1222,11 @@ async fn set_prices_on_chain(
         .await
         .map_err(|e| HandlerError::local(e.to_string()))?;
 
+    let max_time = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .saturating_add(tx_builder::TX_MAX_TIME_SECS);
     let tx = tx_builder::build_invoke_tx(
         &state.config.keeper_account_id,
         &state.config.oracle_contract_id,
@@ -1230,6 +1235,7 @@ async fn set_prices_on_chain(
         state.config.set_prices_tx_fee,
         sequence,
         None,
+        max_time,
     )?;
 
     let signed_xdr = sign_keeper_tx(&state, &tx)?;
@@ -1384,6 +1390,11 @@ async fn execute_handler(
         }
     };
 
+    let max_time = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .saturating_add(tx_builder::TX_MAX_TIME_SECS);
     let tx = tx_builder::build_invoke_tx(
         &state.config.keeper_account_id,
         contract_id,
@@ -1397,6 +1408,7 @@ async fn execute_handler(
         state.config.keeper_tx_fee,
         sequence,
         None,
+        max_time,
     )?;
 
     let signed_xdr = sign_keeper_tx(&state, &tx)?;
@@ -1585,6 +1597,7 @@ async fn simulate_contract_call_once(
         100,
         0, // sequence number is irrelevant for simulation
         None,
+        0, // no time bound for simulation
     )
     .map_err(SimulateError::Build)?;
 
