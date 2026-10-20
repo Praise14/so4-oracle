@@ -443,18 +443,19 @@ async fn execute_keeper_cycle(state: Arc<AppState>) -> Result<CycleSummary, Stri
                     // Tx may still confirm on-chain; retain in-flight to prevent re-submission.
                     warn!(key = %order_key, %error, "order_poll_timeout_key_remains_in_flight");
                     summary.errors += 1;
+                    let tx_hash = error.tx_hash();
                     record_error(
                         &state,
                         &format!("execute_order:{}", order_key),
                         &error.message,
-                        None,
+                        tx_hash.clone(),
                     )
                     .await;
                     record_execution(
                         &state,
                         "execute_order",
                         order_key,
-                        None,
+                        tx_hash,
                         false,
                         Some(error.to_string()),
                     )
@@ -700,12 +701,12 @@ async fn execute_keeper_cycle(state: Arc<AppState>) -> Result<CycleSummary, Stri
             Err(ref error) if error.may_still_confirm() => {
                 warn!(key = %deposit_key, %error, "deposit_poll_timeout_key_remains_in_flight");
                 summary.errors += 1;
-                let tx_hash = poll_timeout_hash(&error.message);
+                let tx_hash = error.tx_hash();
                 record_error(
                     &state,
                     &format!("execute_deposit:{}", deposit_key),
                     &error.message,
-                    None,
+                    tx_hash.clone(),
                 )
                 .await;
                 record_execution(
@@ -877,12 +878,12 @@ async fn execute_keeper_cycle(state: Arc<AppState>) -> Result<CycleSummary, Stri
             Err(ref error) if error.may_still_confirm() => {
                 warn!(key = %withdrawal_key, %error, "withdrawal_poll_timeout_key_remains_in_flight");
                 summary.errors += 1;
-                let tx_hash = poll_timeout_hash(&error.message);
+                let tx_hash = error.tx_hash();
                 record_error(
                     &state,
                     &format!("execute_withdrawal:{}", withdrawal_key),
                     &error.message,
-                    None,
+                    tx_hash.clone(),
                 )
                 .await;
                 record_execution(
@@ -1043,6 +1044,16 @@ impl HandlerError {
             .map(SubmitError::diagnostic_events)
             .unwrap_or_default()
     }
+
+    /// The transaction hash, present only when the error is a `PollTimeout`.
+    /// Reads directly from the typed `SubmitError` variant rather than
+    /// scanning the rendered message string.
+    fn tx_hash(&self) -> Option<String> {
+        match &self.submit {
+            Some(SubmitError::PollTimeout { hash }) => Some(hash.clone()),
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Display for HandlerError {
@@ -1069,27 +1080,6 @@ impl From<HandlerError> for String {
     }
 }
 
-/// Recover the transaction hash from a poll-timeout error message (#721).
-///
-/// `SubmitError::PollTimeout`'s `Display` impl embeds the hash as
-/// `(hash: {hash})` inside a longer sentence, and `execute_handler` prefixes
-/// the whole message with `{method} submit failed: ` before downcasting it to
-/// the `String` that reaches the `is_poll_timeout` guard. Rather than
-/// reconstructing that exact wording, scan for the marker: the hash is always
-/// the first `)`-delimited token after it, whatever prefixes are attached.
-///
-/// Returns `None` for any other error shape, so callers can pass the result
-/// through unconditionally.
-fn poll_timeout_hash(error: &str) -> Option<String> {
-    const MARKER: &str = "(hash: ";
-    let rest = error.split_once(MARKER)?.1;
-    let hash = rest.split_once(')')?.0.trim();
-    if hash.is_empty() {
-        None
-    } else {
-        Some(hash.to_string())
-    }
-}
 
 /// Check if an error message indicates a poll timeout.
 #[allow(dead_code)]
