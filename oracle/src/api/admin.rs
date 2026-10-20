@@ -11,12 +11,22 @@ use serde::Serialize;
 use super::{AdminAuth, ApiError};
 use crate::state::{AppState, CachedPrice, FailedSubmission};
 
+// #1280 — failure counters and last-cycle timestamps moved here from the public
+// /health probe so they are only visible to authenticated admin callers.
 #[derive(Debug, Serialize)]
 pub struct OracleStatusResponse {
     pub last_cycle_time: Option<u64>,
     pub keeper_balance: Option<f64>,
     pub prices: Vec<CachedPrice>,
     pub recent_errors: Vec<FailedSubmission>,
+    pub price_cycle_count: u64,
+    pub keeper_cycle_count: u64,
+    pub token_fetch_failures: u64,
+    pub submit_failures: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_price_cycle_secs_ago: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_keeper_cycle_secs_ago: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -35,12 +45,19 @@ pub async fn oracle_status(
     _auth: AdminAuth,
     State(state): State<Arc<AppState>>,
 ) -> Json<OracleStatusResponse> {
-    let last_cycle_time = state
-        .cycle_status
-        .read()
-        .await
+    let cycle = state.cycle_status.read().await;
+    let last_cycle_time = cycle.last_price_cycle_at.and_then(system_time_secs);
+    let last_price_cycle_secs_ago = cycle
         .last_price_cycle_at
-        .and_then(system_time_secs);
+        .and_then(|t| t.elapsed().ok())
+        .map(|d| d.as_secs());
+    let last_keeper_cycle_secs_ago = cycle
+        .last_keeper_cycle_at
+        .and_then(|t| t.elapsed().ok())
+        .map(|d| d.as_secs());
+    drop(cycle);
+
+    let metrics = state.metrics.to_response();
     let prices = state
         .price_cache
         .read()
@@ -56,6 +73,12 @@ pub async fn oracle_status(
         keeper_balance: None,
         prices,
         recent_errors,
+        price_cycle_count: metrics.price_cycle_count,
+        keeper_cycle_count: metrics.keeper_cycle_count,
+        token_fetch_failures: metrics.token_fetch_failures,
+        submit_failures: metrics.submit_failures,
+        last_price_cycle_secs_ago,
+        last_keeper_cycle_secs_ago,
     })
 }
 
